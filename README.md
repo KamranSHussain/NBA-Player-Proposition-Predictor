@@ -1,6 +1,6 @@
 # NBA Player Proposition Forecasting App
 
-An NBA player-prop forecasting project with a production-style Streamlit interface.
+A NBA player-prop forecasting project with a production-style Streamlit interface.
 
 This repository walks through the full workflow of:
 1. Pulling real NBA data from `nba_api`.
@@ -302,13 +302,6 @@ Practical interpretation:
 4. **Reproducibility differences**
 	1. Neural network training is stochastic (shuffle/dropout).
 	2. Small metric variation across runs is expected.
-
-## Future Improvements
-
-1. Persist trained artifacts to disk.
-2. Add downloadable evaluation reports.
-3. Add richer calibration plots and reliability diagnostics.
-4. Add a reproducibility mode with stricter deterministic settings.
 
 ## License
 
