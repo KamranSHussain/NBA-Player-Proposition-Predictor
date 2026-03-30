@@ -1,4 +1,4 @@
-# NBA Player Proposition Predictor
+# NBA Player Proposition Forecasting App
 
 A NBA player-prop forecasting project with a production-style Streamlit interface.
 
