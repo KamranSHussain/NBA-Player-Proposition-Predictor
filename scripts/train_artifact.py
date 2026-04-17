@@ -46,8 +46,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--max-epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=12)
+    parser.add_argument(
+        "--sequence-length",
+        type=int,
+        default=20,
+        help="History length for transformer model training.",
+    )
     return parser.parse_args()
 
 
@@ -61,7 +67,10 @@ def main() -> None:
     print(f"Fetching data from {args.start_year} to {args.end_year} (exclusive)...")
     train_df, _, _ = get_nba_data(start_year=args.start_year, end_year=args.end_year)
 
-    print(f"Training model with fixed split date {args.split_date}...")
+    print(
+        f"Training transformer model with fixed split date {args.split_date} "
+        f"(sequence_length={args.sequence_length})..."
+    )
     artifacts = train_model(
         df=train_df,
         split_date=args.split_date,
@@ -69,6 +78,7 @@ def main() -> None:
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         early_stopping_patience=args.patience,
+        sequence_length=args.sequence_length,
     )
 
     test_eval = evaluate_test_set(df=train_df, artifacts=artifacts)

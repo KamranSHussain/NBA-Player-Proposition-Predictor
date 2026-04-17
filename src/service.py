@@ -21,18 +21,19 @@ import torch
 from nba_api.stats.endpoints import commonteamroster
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.data import TEAM_INFERENCE_COLS
-from src.model import DEFAULT_QUANTILES, PinballLoss, PlayerPropNN
+from src.data import RAW_PLAYER_SEQUENCE_COLS, TEAM_INFERENCE_COLS
+from src.model import DEFAULT_QUANTILES, PinballLoss, PlayerPropTransformer
 
 TARGET_COLUMN = "PTS"
 DEFAULT_BATCH_SIZE = 256
 DEFAULT_MAX_EPOCHS = 200
-DEFAULT_LEARNING_RATE = 1e-3
+DEFAULT_LEARNING_RATE = 1e-4
 DEFAULT_WEIGHT_DECAY = 1e-5
 DEFAULT_ROSTER_CAP = 18
 DEFAULT_EARLY_STOPPING_PATIENCE = 12
 DEFAULT_EARLY_STOPPING_MIN_DELTA = 1e-4
 DEFAULT_VALIDATION_FRACTION = 0.15
+DEFAULT_SEQUENCE_LENGTH = 20
 
 ID_COLUMNS: tuple[str, ...] = (
     "GAME_ID",
@@ -54,7 +55,7 @@ CONTEXT_COLUMNS: tuple[str, ...] = (
 class ModelArtifacts:
     """Objects and metadata produced by model training."""
 
-    model: PlayerPropNN
+    model: torch.nn.Module
     feature_columns: list[str]
     quantiles: tuple[float, ...]
     train_end_date: pd.Timestamp
@@ -66,6 +67,8 @@ class ModelArtifacts:
     test_loss: float
     feature_mean: pd.Series
     feature_std: pd.Series
+    model_type: str = "transformer"
+    sequence_length: int = DEFAULT_SEQUENCE_LENGTH
 
 
 @dataclass
@@ -90,6 +93,12 @@ def _to_timestamp(split_date: str | date | datetime | pd.Timestamp) -> pd.Timest
 
 def feature_columns_from_frame(df: pd.DataFrame) -> list[str]:
     """Infer model feature columns from the processed training frame."""
+    preferred_sequence_features = [*CONTEXT_COLUMNS, *RAW_PLAYER_SEQUENCE_COLS]
+    available_preferred = [col for col in preferred_sequence_features if col in df.columns]
+    if available_preferred:
+        return available_preferred
+
+    # Fallback for legacy frames that do not expose raw sequence columns.
     excluded = set(ID_COLUMNS) | {TARGET_COLUMN}
     return [col for col in df.columns if col not in excluded]
 
@@ -130,6 +139,61 @@ def _to_tensor(values: np.ndarray) -> torch.Tensor:
     return torch.tensor(values.astype(np.float32), dtype=torch.float32)
 
 
+def _build_history_tensors(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    history_len: int,
+) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
+    """Build fixed-length per-player history tensors from ordered game rows."""
+    ordered = df.copy()
+    ordered["GAME_DATE"] = pd.to_datetime(ordered["GAME_DATE"])
+    ordered = ordered.sort_values(by=["PLAYER_ID", "GAME_DATE", "GAME_ID"]).reset_index(drop=True)
+
+    feat_matrix = np.nan_to_num(
+        ordered[feature_cols].to_numpy(dtype=np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    targets = np.nan_to_num(
+        ordered[[TARGET_COLUMN]].to_numpy(dtype=np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    player_ids = ordered["PLAYER_ID"].to_numpy()
+
+    n_rows = len(ordered)
+    feat_dim = len(feature_cols)
+    seq = np.zeros((n_rows, history_len, feat_dim), dtype=np.float32)
+    pad_mask = np.ones((n_rows, history_len), dtype=bool)
+
+    start_idx = 0
+    while start_idx < n_rows:
+        end_idx = start_idx
+        current_player = player_ids[start_idx]
+        while end_idx < n_rows and player_ids[end_idx] == current_player:
+            end_idx += 1
+
+        for local_idx in range(end_idx - start_idx):
+            global_idx = start_idx + local_idx
+            hist_start = max(0, local_idx - history_len)
+            history = feat_matrix[start_idx + hist_start : start_idx + local_idx]
+            if len(history) == 0:
+                # Avoid all-masked rows, which can yield non-finite attention outputs.
+                seq[global_idx, -1, :] = 0.0
+                pad_mask[global_idx, -1] = False
+                continue
+
+            hist_len = history.shape[0]
+            seq[global_idx, history_len - hist_len :, :] = history
+            pad_mask[global_idx, history_len - hist_len :] = False
+
+        start_idx = end_idx
+
+    return ordered, seq, pad_mask, targets
+
+
 def _split_train_validation(
     train_df: pd.DataFrame,
     val_fraction: float,
@@ -162,8 +226,9 @@ def train_model(
     val_fraction: float = DEFAULT_VALIDATION_FRACTION,
     quantiles: tuple[float, ...] = DEFAULT_QUANTILES,
     random_seed: int = 42,
+    sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
 ) -> ModelArtifacts:
-    """Train quantile model with temporal validation early stopping."""
+    """Train transformer quantile model with temporal validation early stopping."""
     if TARGET_COLUMN not in df.columns:
         raise ValueError(f"Expected target column '{TARGET_COLUMN}' in training dataframe.")
     if max_epochs < 1:
@@ -172,6 +237,8 @@ def train_model(
         raise ValueError("early_stopping_patience must be >= 1.")
     if early_stopping_min_delta < 0:
         raise ValueError("early_stopping_min_delta must be >= 0.")
+    if sequence_length < 1:
+        raise ValueError("sequence_length must be >= 1.")
 
     split_ts = _to_timestamp(split_date)
     torch.manual_seed(random_seed)
@@ -179,44 +246,92 @@ def train_model(
 
     feature_cols = feature_columns_from_frame(df)
     train_df, test_df = _split_train_test(df=df, split_date=split_ts)
-    fit_df, val_df = _split_train_validation(train_df=train_df, val_fraction=val_fraction)
+    split_df = df.copy()
+    split_df["GAME_DATE"] = pd.to_datetime(split_df["GAME_DATE"])
 
-    train_x = fit_df[feature_cols].copy()
-    val_x = val_df[feature_cols].copy()
-    test_x = test_df[feature_cols].copy()
-    train_x, val_x, feature_mean, feature_std = _standardize_train_test(train_x=train_x, test_x=val_x)
-    test_x = (test_x - feature_mean) / feature_std
+    train_mask_df = split_df["GAME_DATE"] <= split_ts
+    train_features = split_df.loc[train_mask_df, feature_cols].apply(pd.to_numeric, errors="coerce")
+    feature_mean = train_features.mean(axis=0).fillna(0.0)
+    feature_std = (
+        train_features.std(axis=0)
+        .replace(0.0, 1.0)
+        .replace([np.inf, -np.inf], 1.0)
+        .fillna(1.0)
+    )
 
-    train_y = fit_df[[TARGET_COLUMN]].to_numpy()
-    val_y = val_df[[TARGET_COLUMN]].to_numpy()
-    test_y = test_df[[TARGET_COLUMN]].to_numpy()
+    normalized_df = split_df.copy()
+    normalized_df[feature_cols] = normalized_df[feature_cols].apply(pd.to_numeric, errors="coerce")
+    normalized_df[feature_cols] = (normalized_df[feature_cols] - feature_mean) / feature_std
+    normalized_df[feature_cols] = (
+        normalized_df[feature_cols]
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+    ordered_df, seq, pad_mask, targets = _build_history_tensors(
+        df=normalized_df,
+        feature_cols=feature_cols,
+        history_len=sequence_length,
+    )
 
-    train_ds = TensorDataset(_to_tensor(train_x.to_numpy()), _to_tensor(train_y))
-    val_x_tensor = _to_tensor(val_x.to_numpy())
-    val_y_tensor = _to_tensor(val_y)
+    ordered_train_idx = ordered_df[ordered_df["GAME_DATE"] <= split_ts].sort_values("GAME_DATE").index.to_numpy()
+    ordered_test_idx = ordered_df[ordered_df["GAME_DATE"] > split_ts].index.to_numpy()
+
+    val_size = max(1, int(len(ordered_train_idx) * val_fraction))
+    fit_size = len(ordered_train_idx) - val_size
+    if fit_size < 1:
+        raise ValueError("Not enough train rows for validation split. Increase date range.")
+
+    fit_idx = ordered_train_idx[:fit_size]
+    val_idx = ordered_train_idx[fit_size:]
+
+    train_ds = TensorDataset(
+        _to_tensor(seq[fit_idx]),
+        torch.tensor(pad_mask[fit_idx], dtype=torch.bool),
+        _to_tensor(targets[fit_idx]),
+    )
+    val_seq_tensor = _to_tensor(seq[val_idx])
+    val_mask_tensor = torch.tensor(pad_mask[val_idx], dtype=torch.bool)
+    val_y_tensor = _to_tensor(targets[val_idx])
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
-    model = PlayerPropNN(input_size=len(feature_cols))
+    model = PlayerPropTransformer(
+        input_size=len(feature_cols),
+        quantiles=quantiles,
+        max_len=max(sequence_length + 1, 32),
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     criterion = PinballLoss(quantiles=quantiles)
 
-    best_state_dict: dict[str, torch.Tensor] | None = None
+    best_state_dict = None
     best_val_loss = float("inf")
     best_epoch = 0
     epochs_without_improvement = 0
 
     for epoch in range(1, max_epochs + 1):
         model.train()
-        for batch_x, batch_y in train_loader:
+        for batch_seq, batch_mask, batch_y in train_loader:
             optimizer.zero_grad()
-            preds = model(batch_x)
+            preds = model(batch_seq, padding_mask=batch_mask)
             loss = criterion(preds, batch_y)
+            if not torch.isfinite(loss):
+                raise ValueError(
+                    "Non-finite training loss detected. "
+                    "Try lowering learning_rate and/or sequence_length."
+                )
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
         model.eval()
         with torch.no_grad():
-            current_val_loss = float(criterion(model(val_x_tensor), val_y_tensor).item())
+            current_val_loss = float(
+                criterion(model(val_seq_tensor, padding_mask=val_mask_tensor), val_y_tensor).item()
+            )
+        if not np.isfinite(current_val_loss):
+            raise ValueError(
+                "Validation loss became non-finite. "
+                "Try lowering learning_rate and/or sequence_length."
+            )
 
         if current_val_loss < (best_val_loss - early_stopping_min_delta):
             best_val_loss = current_val_loss
@@ -233,12 +348,22 @@ def train_model(
 
     model.eval()
     with torch.no_grad():
+        fit_seq_tensor = _to_tensor(seq[fit_idx])
+        fit_mask_tensor = torch.tensor(pad_mask[fit_idx], dtype=torch.bool)
+        fit_y_tensor = _to_tensor(targets[fit_idx])
+
+        test_seq_tensor = _to_tensor(seq[ordered_test_idx])
+        test_mask_tensor = torch.tensor(pad_mask[ordered_test_idx], dtype=torch.bool)
+        test_y_tensor = _to_tensor(targets[ordered_test_idx])
+
         train_loss = float(
-            criterion(model(_to_tensor(train_x.to_numpy())), _to_tensor(train_y)).item()
+            criterion(model(fit_seq_tensor, padding_mask=fit_mask_tensor), fit_y_tensor).item()
         )
-        val_loss = float(criterion(model(val_x_tensor), val_y_tensor).item())
+        val_loss = float(
+            criterion(model(val_seq_tensor, padding_mask=val_mask_tensor), val_y_tensor).item()
+        )
         test_loss = float(
-            criterion(model(_to_tensor(test_x.to_numpy())), _to_tensor(test_y)).item()
+            criterion(model(test_seq_tensor, padding_mask=test_mask_tensor), test_y_tensor).item()
         )
 
     return ModelArtifacts(
@@ -254,6 +379,8 @@ def train_model(
         test_loss=test_loss,
         feature_mean=feature_mean,
         feature_std=feature_std,
+        model_type="transformer",
+        sequence_length=sequence_length,
     )
 
 
@@ -277,7 +404,9 @@ def _normalized_features(features: pd.DataFrame, artifacts: ModelArtifacts) -> p
             aligned[col] = default_value
 
     aligned = aligned[artifacts.feature_columns].copy()
-    return (aligned - artifacts.feature_mean) / artifacts.feature_std
+    normalized = (aligned - artifacts.feature_mean) / artifacts.feature_std
+    normalized = normalized.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return normalized
 
 
 def _team_context_row(current_teams: pd.DataFrame, team_id: int | str) -> pd.Series:
@@ -312,7 +441,7 @@ def _limit_roster_size(players: pd.DataFrame, max_players: int = DEFAULT_ROSTER_
     sort_cols: list[str] = []
     ascending: list[bool] = []
 
-    for col in ("Rolling_10G_Games_Played", "Rolling_5G_Games_Played", "Rolling_10G_MIN", "Rolling_5G_MIN"):
+    for col in ("MIN", "AST", "REB", "STL"):
         if col in ranked.columns:
             ranked[col] = pd.to_numeric(ranked[col], errors="coerce").fillna(0.0)
             sort_cols.append(col)
@@ -381,11 +510,14 @@ def _build_matchup_features(
     feature_df["home"] = int(home_flag)
 
     for col in TEAM_INFERENCE_COLS:
-        # Team offense from own team, opponent profile from opposing team.
-        if col.startswith("Team_Rolling_"):
-            feature_df[col] = own_team[col]
+        # Team features come from own team row; opponent features come from opponent row.
+        if col.startswith("Team_"):
+            feature_df[col] = own_team.get(col, 0.0)
+        elif col.startswith("Opp_"):
+            mirrored_team_col = col.replace("Opp_", "Team_", 1)
+            feature_df[col] = opp_team.get(mirrored_team_col, opp_team.get(col, 0.0))
         else:
-            feature_df[col] = opp_team[col]
+            feature_df[col] = opp_team.get(col, 0.0)
 
     return feature_df
 
@@ -393,9 +525,55 @@ def _build_matchup_features(
 def _predict_from_features(feature_df: pd.DataFrame, artifacts: ModelArtifacts) -> np.ndarray:
     """Run model inference and return quantile predictions as numpy array."""
     model_input = _normalized_features(feature_df, artifacts=artifacts)
+    seq_len = int(getattr(artifacts, "sequence_length", DEFAULT_SEQUENCE_LENGTH))
+    matrix = model_input.to_numpy(dtype=np.float32)
+    batch_size, feat_dim = matrix.shape
+
+    seq = np.zeros((batch_size, seq_len, feat_dim), dtype=np.float32)
+    pad_mask = np.ones((batch_size, seq_len), dtype=bool)
+
+    # For live matchup inference, we inject the latest assembled state as one valid token.
+    seq[:, -1, :] = matrix
+    pad_mask[:, -1] = False
+
     with torch.no_grad():
-        preds = artifacts.model(_to_tensor(model_input.to_numpy())).numpy()
+        preds = artifacts.model(
+            _to_tensor(seq),
+            padding_mask=torch.tensor(pad_mask, dtype=torch.bool),
+        ).numpy()
     return preds
+
+
+def _predict_test_set_with_transformer(
+    df: pd.DataFrame,
+    artifacts: ModelArtifacts,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """Generate test-split predictions for transformer artifacts."""
+    feature_cols = artifacts.feature_columns
+    sequence_length = int(getattr(artifacts, "sequence_length", DEFAULT_SEQUENCE_LENGTH))
+
+    full_df = df.copy()
+    full_df["GAME_DATE"] = pd.to_datetime(full_df["GAME_DATE"])
+    full_df[feature_cols] = full_df[feature_cols].apply(pd.to_numeric, errors="coerce")
+    full_df[feature_cols] = (full_df[feature_cols] - artifacts.feature_mean) / artifacts.feature_std
+    full_df[feature_cols] = full_df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    ordered_df, seq, pad_mask, _ = _build_history_tensors(
+        df=full_df,
+        feature_cols=feature_cols,
+        history_len=sequence_length,
+    )
+
+    test_idx = ordered_df[ordered_df["GAME_DATE"] > artifacts.train_end_date].index.to_numpy()
+    if len(test_idx) == 0:
+        raise ValueError("No test rows found for transformer evaluation.")
+
+    seq_tensor = _to_tensor(seq[test_idx])
+    mask_tensor = torch.tensor(pad_mask[test_idx], dtype=torch.bool)
+    with torch.no_grad():
+        preds = artifacts.model(seq_tensor, padding_mask=mask_tensor).numpy()
+
+    return ordered_df.loc[test_idx].reset_index(drop=True), preds
 
 
 def predict_matchup(
@@ -484,6 +662,8 @@ def model_summary(artifacts: ModelArtifacts) -> dict[str, Any]:
         "test_loss": round(artifacts.test_loss, 6),
         "feature_count": len(artifacts.feature_columns),
         "quantiles": list(artifacts.quantiles),
+        "model_type": "transformer",
+        "sequence_length": int(getattr(artifacts, "sequence_length", DEFAULT_SEQUENCE_LENGTH)),
     }
 
 
@@ -501,10 +681,7 @@ def evaluate_test_set(df: pd.DataFrame, artifacts: ModelArtifacts) -> TestSetEva
         full_df.groupby("PLAYER_ID")["GAME_ID"].nunique().astype(float)
     )
 
-    _, test_df = _split_train_test(df=df, split_date=artifacts.train_end_date)
-
-    feature_df = test_df[artifacts.feature_columns].copy()
-    preds = _predict_from_features(feature_df=feature_df, artifacts=artifacts)
+    test_df, preds = _predict_test_set_with_transformer(df=df, artifacts=artifacts)
     y_true = test_df[TARGET_COLUMN].to_numpy(dtype=float)
 
     quantile_rows: list[dict[str, float]] = []

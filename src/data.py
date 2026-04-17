@@ -2,15 +2,14 @@
 
 This module provides a single public pipeline function, ``get_nba_data``, that
 returns:
-1. Historical training data with leakage-safe shifted rolling features.
+1. Historical training data with leakage-safe shifted player features.
 2. Current player feature state for inference.
-3. Current team/opponent context feature state for inference.
+3. Current team metadata for inference/UI.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -18,11 +17,9 @@ from nba_api.stats.endpoints import leaguegamelog
 
 DEFAULT_START_YEAR = 2020
 DEFAULT_END_YEAR = 2026
-ROLLING_WINDOWS: tuple[int, ...] = (5, 10)
 MIN_MODEL_DATE = pd.Timestamp("2020-01-01")
 
-PLAYER_STATS_TO_ROLL: tuple[str, ...] = (
-    "PTS",
+RAW_PLAYER_SEQUENCE_COLS: tuple[str, ...] = (
     "MIN",
     "FGM",
     "FGA",
@@ -32,49 +29,18 @@ PLAYER_STATS_TO_ROLL: tuple[str, ...] = (
     "FTA",
     "AST",
     "REB",
+    "OREB",
+    "DREB",
     "TOV",
     "STL",
+    "BLK",
     "PF",
+    "PLUS_MINUS",
 )
 
-TEAM_OFFENSE_COLS: tuple[str, ...] = ("PTS", "AST", "FG3A", "FGA")
-TEAM_DEFENSE_COLS: tuple[str, ...] = ("opponentScore", "STL", "BLK", "DREB")
+PLAYER_INFERENCE_COLS: tuple[str, ...] = ()
 
-PLAYER_INFERENCE_COLS: tuple[str, ...] = (
-    "Rolling_5G_Games_Played",
-    "Rolling_10G_Games_Played",
-    "Rolling_5G_MIN",
-    "Rolling_10G_MIN",
-    "Rolling_5G_PTS",
-    "Rolling_10G_PTS",
-    "Rolling_5G_FGA",
-    "Rolling_10G_FGA",
-    "Rolling_5G_FG_PCT",
-    "Rolling_10G_FG_PCT",
-    "Rolling_5G_FG3A",
-    "Rolling_10G_FG3A",
-    "Rolling_5G_FTA",
-    "Rolling_10G_FTA",
-    "Rolling_5G_AST",
-    "Rolling_10G_AST",
-    "Rolling_5G_REB",
-    "Rolling_10G_REB",
-    "Rolling_5G_TOV",
-    "Rolling_10G_TOV",
-)
-
-TEAM_INFERENCE_COLS: tuple[str, ...] = (
-    "Team_Rolling_5G_PTS",
-    "Team_Rolling_10G_PTS",
-    "Team_Rolling_5G_FGA",
-    "Team_Rolling_10G_FGA",
-    "Opp_Rolling_5G_opponentScore",
-    "Opp_Rolling_10G_opponentScore",
-    "Opp_Rolling_5G_STL",
-    "Opp_Rolling_10G_STL",
-    "Opp_Rolling_5G_BLK",
-    "Opp_Rolling_10G_BLK",
-)
+TEAM_INFERENCE_COLS: tuple[str, ...] = ()
 
 
 def _season_strings(start_year: int, end_year: int) -> list[str]:
@@ -114,8 +80,11 @@ def fetch_nba_api_data(season: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     time.sleep(2)
 
-    players_df = pd.concat([rs_players, po_players], ignore_index=True)
-    teams_df = pd.concat([rs_teams, po_teams], ignore_index=True)
+    player_frames = [frame for frame in (rs_players, po_players) if not frame.empty]
+    team_frames = [frame for frame in (rs_teams, po_teams) if not frame.empty]
+
+    players_df = pd.concat(player_frames, ignore_index=True) if player_frames else rs_players.copy()
+    teams_df = pd.concat(team_frames, ignore_index=True) if team_frames else rs_teams.copy()
     return players_df, teams_df
 
 
@@ -148,60 +117,6 @@ def fetch_multiple_seasons(
     return players_raw, teams_raw
 
 
-def _add_player_rolling_features(df: pd.DataFrame, windows: Iterable[int]) -> pd.DataFrame:
-    """Add unshifted rolling player box-score and percentage features."""
-    for stat in PLAYER_STATS_TO_ROLL:
-        for window in windows:
-            col = f"Rolling_{window}G_{stat}"
-            df[col] = df.groupby("PLAYER_ID")[stat].transform(
-                lambda series: series.rolling(window=window, min_periods=1).mean()
-            )
-
-    for window in windows:
-        df[f"Rolling_{window}G_FG_PCT"] = np.where(
-            df[f"Rolling_{window}G_FGA"] > 0,
-            df[f"Rolling_{window}G_FGM"] / df[f"Rolling_{window}G_FGA"],
-            0,
-        )
-        df[f"Rolling_{window}G_FG3_PCT"] = np.where(
-            df[f"Rolling_{window}G_FG3A"] > 0,
-            df[f"Rolling_{window}G_FG3M"] / df[f"Rolling_{window}G_FG3A"],
-            0,
-        )
-        df[f"Rolling_{window}G_FT_PCT"] = np.where(
-            df[f"Rolling_{window}G_FTA"] > 0,
-            df[f"Rolling_{window}G_FTM"] / df[f"Rolling_{window}G_FTA"],
-            0,
-        )
-        df[f"Rolling_{window}G_Games_Played"] = df.groupby("PLAYER_ID")["GAME_ID"].transform(
-            lambda series: series.rolling(window=window, min_periods=1).count()
-        )
-
-    return df
-
-
-def _build_team_matchups(teams_raw: pd.DataFrame, windows: Iterable[int]) -> pd.DataFrame:
-    """Create team-vs-opponent rolling context features for each team game row."""
-    matchups = pd.merge(teams_raw, teams_raw, on="GAME_ID", suffixes=("", "_OPP"))
-    matchups = matchups[matchups["TEAM_ID"] != matchups["TEAM_ID_OPP"]].copy()
-    matchups = matchups.sort_values(by=["TEAM_ID", "GAME_DATE"]).reset_index(drop=True)
-
-    for stat in TEAM_OFFENSE_COLS:
-        for window in windows:
-            matchups[f"Team_Rolling_{window}G_{stat}"] = matchups.groupby("TEAM_ID")[stat].transform(
-                lambda series: series.rolling(window=window, min_periods=1).mean()
-            )
-
-    matchups["opponentScore"] = matchups["PTS_OPP"]
-    for stat in TEAM_DEFENSE_COLS:
-        for window in windows:
-            matchups[f"Opp_Rolling_{window}G_{stat}"] = matchups.groupby("TEAM_ID")[stat].transform(
-                lambda series: series.rolling(window=window, min_periods=1).mean()
-            )
-
-    return matchups
-
-
 def get_nba_data(
     start_year: int = DEFAULT_START_YEAR,
     end_year: int = DEFAULT_END_YEAR,
@@ -217,22 +132,7 @@ def get_nba_data(
     df["days_of_rest"] = df.groupby("PLAYER_ID")["GAME_DATE"].diff().dt.days
     df["days_of_rest"] = df["days_of_rest"].fillna(10).clip(upper=10)
 
-    df = _add_player_rolling_features(df=df, windows=ROLLING_WINDOWS)
-
-    rolling_cols_player = [col for col in df.columns if "Rolling_" in col]
-    df[rolling_cols_player] = df.groupby("PLAYER_ID")[rolling_cols_player].shift(1)
-
-    matchups = _build_team_matchups(teams_raw=teams_raw, windows=ROLLING_WINDOWS)
-    rolling_cols_team = [
-        col
-        for col in matchups.columns
-        if "Team_Rolling_" in col or "Opp_Rolling_" in col
-    ]
-    matchups[rolling_cols_team] = matchups.groupby("TEAM_ID")[rolling_cols_team].shift(1)
-
-    team_profiles = matchups[["GAME_ID", "TEAM_ID", "TEAM_ID_OPP", *rolling_cols_team]]
-    final_df = pd.merge(df, team_profiles, on=["GAME_ID", "TEAM_ID"], how="left")
-    final_df = final_df.rename(columns={"TEAM_ID_OPP": "opponentTeamId"})
+    final_df = df.copy()
 
     columns_of_interest = [
         "GAME_ID",
@@ -240,11 +140,11 @@ def get_nba_data(
         "PLAYER_ID",
         "PLAYER_NAME",
         "TEAM_ID",
-        "opponentTeamId",
         "PTS",
         "is_playoff",
         "home",
         "days_of_rest",
+        *RAW_PLAYER_SEQUENCE_COLS,
         *PLAYER_INFERENCE_COLS,
         *TEAM_INFERENCE_COLS,
     ]
@@ -252,21 +152,26 @@ def get_nba_data(
     final_df = final_df[columns_of_interest].copy()
     final_df = final_df[final_df["GAME_DATE"] >= MIN_MODEL_DATE].copy()
 
-    final_df = final_df.dropna(
-        subset=["Rolling_5G_PTS", "Opp_Rolling_5G_opponentScore"]
-    ).reset_index(drop=True)
+    final_df = final_df.reset_index(drop=True)
 
     current_players = df[df["GAME_DATE"] >= MIN_MODEL_DATE].groupby("PLAYER_ID").tail(1).copy()
-    current_teams = matchups[matchups["GAME_DATE"] >= MIN_MODEL_DATE].groupby("TEAM_ID").tail(1).copy()
+    current_teams = teams_raw[teams_raw["GAME_DATE"] >= MIN_MODEL_DATE].groupby("TEAM_ID").tail(1).copy()
 
-    player_context_cols = ["PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "days_of_rest", *PLAYER_INFERENCE_COLS]
+    player_context_cols = [
+        "PLAYER_ID",
+        "PLAYER_NAME",
+        "TEAM_ID",
+        "days_of_rest",
+        *RAW_PLAYER_SEQUENCE_COLS,
+        *PLAYER_INFERENCE_COLS,
+    ]
     current_players = current_players[player_context_cols].copy()
 
     team_meta_cols = ["TEAM_ID"]
     for optional_col in ("TEAM_ABBREVIATION", "TEAM_NAME"):
         if optional_col in current_teams.columns:
             team_meta_cols.append(optional_col)
-    current_teams = current_teams[[*team_meta_cols, *TEAM_INFERENCE_COLS]].copy()
+    current_teams = current_teams[team_meta_cols].copy()
 
     return final_df, current_players.reset_index(drop=True), current_teams.reset_index(drop=True)
 
@@ -274,7 +179,7 @@ def get_nba_data(
 __all__ = [
     "DEFAULT_START_YEAR",
     "DEFAULT_END_YEAR",
-    "ROLLING_WINDOWS",
+    "RAW_PLAYER_SEQUENCE_COLS",
     "PLAYER_INFERENCE_COLS",
     "TEAM_INFERENCE_COLS",
     "fetch_nba_api_data",
