@@ -93,7 +93,11 @@ def _to_timestamp(split_date: str | date | datetime | pd.Timestamp) -> pd.Timest
 
 def feature_columns_from_frame(df: pd.DataFrame) -> list[str]:
     """Infer model feature columns from the processed training frame."""
-    preferred_sequence_features = [*CONTEXT_COLUMNS, *RAW_PLAYER_SEQUENCE_COLS]
+    preferred_sequence_features = [
+        *CONTEXT_COLUMNS,
+        *RAW_PLAYER_SEQUENCE_COLS,
+        *TEAM_INFERENCE_COLS,
+    ]
     available_preferred = [col for col in preferred_sequence_features if col in df.columns]
     if available_preferred:
         return available_preferred
@@ -522,24 +526,79 @@ def _build_matchup_features(
     return feature_df
 
 
-def _predict_from_features(feature_df: pd.DataFrame, artifacts: ModelArtifacts) -> np.ndarray:
-    """Run model inference and return quantile predictions as numpy array."""
-    model_input = _normalized_features(feature_df, artifacts=artifacts)
+def _build_inference_sequence(
+    history_df: pd.DataFrame,
+    current_features: pd.DataFrame,
+    artifacts: ModelArtifacts,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a padded sequence of prior games plus the current matchup token."""
+    feature_cols = artifacts.feature_columns
     seq_len = int(getattr(artifacts, "sequence_length", DEFAULT_SEQUENCE_LENGTH))
-    matrix = model_input.to_numpy(dtype=np.float32)
-    batch_size, feat_dim = matrix.shape
 
-    seq = np.zeros((batch_size, seq_len, feat_dim), dtype=np.float32)
-    pad_mask = np.ones((batch_size, seq_len), dtype=bool)
+    history_matrix = np.nan_to_num(
+        history_df[feature_cols].to_numpy(dtype=np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    current_matrix = np.nan_to_num(
+        current_features[feature_cols].to_numpy(dtype=np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
 
-    # For live matchup inference, we inject the latest assembled state as one valid token.
-    seq[:, -1, :] = matrix
-    pad_mask[:, -1] = False
+    seq = np.zeros((seq_len, len(feature_cols)), dtype=np.float32)
+    pad_mask = np.ones((seq_len,), dtype=bool)
+
+    history_slots = max(0, seq_len - 1)
+    history_len = min(history_slots, history_matrix.shape[0])
+    if history_len > 0:
+        seq[history_slots - history_len : history_slots, :] = history_matrix[-history_len:]
+        pad_mask[history_slots - history_len : history_slots] = False
+
+    seq[-1, :] = current_matrix[0]
+    pad_mask[-1] = False
+    return seq, pad_mask
+
+
+def _predict_from_features(
+    feature_df: pd.DataFrame,
+    current_history_df: pd.DataFrame,
+    artifacts: ModelArtifacts,
+) -> np.ndarray:
+    """Run model inference on 20-step player histories and return quantile predictions."""
+    seq_len = int(getattr(artifacts, "sequence_length", DEFAULT_SEQUENCE_LENGTH))
+    feature_cols = artifacts.feature_columns
+
+    seq_batch: list[np.ndarray] = []
+    mask_batch: list[np.ndarray] = []
+    for _, current_row in feature_df.iterrows():
+        player_id = current_row["PLAYER_ID"]
+        history_rows = current_history_df[
+            (current_history_df["PLAYER_ID"] == player_id)
+            & (current_history_df["GAME_DATE"] < current_row["GAME_DATE"])
+        ].copy()
+        history_rows = history_rows.sort_values(by=["GAME_DATE", "GAME_ID"]).reset_index(drop=True)
+
+        # Match train-time scaling for both history tokens and the current matchup token.
+        history_rows_norm = _normalized_features(history_rows, artifacts=artifacts)
+        current_row_norm = _normalized_features(current_row.to_frame().T, artifacts=artifacts)
+
+        seq, pad_mask = _build_inference_sequence(history_rows_norm, current_row_norm, artifacts)
+        seq_batch.append(seq)
+        mask_batch.append(pad_mask)
+
+    if not seq_batch:
+        return np.empty((0, len(artifacts.quantiles)), dtype=np.float32)
+
+    seq_tensor = _to_tensor(np.stack(seq_batch, axis=0))
+    mask_tensor = torch.tensor(np.stack(mask_batch, axis=0), dtype=torch.bool)
 
     with torch.no_grad():
         preds = artifacts.model(
-            _to_tensor(seq),
-            padding_mask=torch.tensor(pad_mask, dtype=torch.bool),
+            seq_tensor,
+            padding_mask=mask_tensor,
         ).numpy()
     return preds
 
@@ -580,6 +639,7 @@ def predict_matchup(
     artifacts: ModelArtifacts,
     current_players: pd.DataFrame,
     current_teams: pd.DataFrame,
+    history_df: pd.DataFrame,
     home_team_id: int | str,
     away_team_id: int | str,
     is_playoff: bool,
@@ -613,8 +673,8 @@ def predict_matchup(
         home_flag=0,
     )
 
-    home_preds = _predict_from_features(home_features, artifacts=artifacts)
-    away_preds = _predict_from_features(away_features, artifacts=artifacts)
+    home_preds = _predict_from_features(home_features, current_history_df=history_df, artifacts=artifacts)
+    away_preds = _predict_from_features(away_features, current_history_df=history_df, artifacts=artifacts)
 
     pred_cols = [f"q{int(q * 100)}" for q in artifacts.quantiles]
 

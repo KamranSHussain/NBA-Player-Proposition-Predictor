@@ -23,7 +23,7 @@ from src.service import evaluate_test_set, model_summary, train_model
 
 DEFAULT_START_YEAR = 2020
 DEFAULT_SPLIT_DATE = "2024-06-18"
-DEFAULT_OUTPUT_PATH = Path("models/player_prop_artifacts.pt")
+DEFAULT_OUTPUT_PATH = Path("models/player_prop_artifacts_opp28.pt")
 
 
 def _rolling_end_year_exclusive(today: date | None = None) -> int:

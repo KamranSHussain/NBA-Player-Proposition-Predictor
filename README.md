@@ -1,333 +1,196 @@
-# NBA Player Proposition Forecasting App
+# NBA Player Prop Forecasting App
 
-A NBA player-prop forecasting project with a production-style Streamlit interface.
+This repository contains a production-style Streamlit app for NBA player points prop forecasting.
+It predicts uncertainty-aware outcomes with a transformer quantile model and includes a betting-lines workflow with automatic result grading.
 
-This repository walks through the full workflow of:
-1. Pulling real NBA data from `nba_api`.
-2. Building leakage-safe rolling player and team features.
-3. Training a PyTorch quantile-regression model offline.
-4. Evaluating out-of-sample performance.
-5. Loading a pre-trained artifact and producing matchup-specific player projections (`q10`, `q50`, `q90`) with roster-aware filtering.
+## Current Project State
 
-## Overview
+### What is implemented now
+1. Transformer-only modeling pipeline for player points (`PTS`) quantile regression.
+2. Quantile outputs from the loaded artifact (default artifact is configured for `q10`, `q50`, `q90`).
+3. Auto data loading from 2020 through the current season window.
+4. Fixed train/test split date at `2024-06-18` for artifact consistency.
+5. Three app pages:
+1. `Predict Matchup`
+2. `Betting Lines`
+3. `Test Stats`
+6. Betting page grades picks using completed game stats fetched automatically from `nba_api`.
 
-Sports betting and prop modeling benefit from uncertainty-aware forecasts. Instead of only predicting one point estimate, this project predicts a **distribution band** for each player:
+### What is no longer the current setup
+1. Legacy rolling-feature-only schema.
+2. Legacy MLP-only model path.
+3. Manual CSV updates for completed actual points (now automatic via API lookup, with optional manual fallback fields).
 
-1. `q10`: conservative floor outcome.
-2. `q50`: median outcome.
-3. `q90`: ceiling outcome.
+## Architecture
 
-The app is designed to be easy for non-ML users:
-1. Auto-load processed data from 2020 to present.
-2. Auto-load a pre-trained model artifact.
-3. Choose a matchup and playoff flag.
-4. View roster previews and quantile projections for both teams.
+### Data layer (`src/data.py`)
+1. Pulls multi-season player and team game logs from `nba_api` (`LeagueGameLog`).
+2. Builds leakage-safe player rows with context features.
+3. Adds opponent last-game context features for inference and training.
+4. Returns:
+1. `final_df` for training/evaluation.
+2. `current_players` for live matchup inference.
+3. `current_teams` for team metadata and opponent context.
 
-## Educational Goals
+### Model layer (`src/model.py`)
+1. `PlayerPropTransformer`: sequence model over per-player game history.
+2. `PinballLoss`: multi-quantile loss function.
+3. Default quantiles in code: `(0.10, 0.50, 0.90)`.
 
-This project demonstrates a practical ML system with a clear separation of concerns:
+### Service layer (`src/service.py`)
+1. `train_model(...)`: trains transformer artifacts with temporal validation and early stopping.
+2. `predict_matchup(...)`: predicts home/away player quantiles for selected matchup.
+3. `get_matchup_rosters(...)`: resolves official roster previews.
+4. `evaluate_test_set(...)`: computes test diagnostics and calibration-oriented metrics.
+5. `model_summary(...)`: artifact metadata for app display.
 
-1. **Data Engineering**
-Build rolling statistics and opponent context from noisy game logs while avoiding leakage.
+## Active Feature Schema
 
-2. **Modeling for Uncertainty**
-Use pinball loss for simultaneous quantile regression in PyTorch.
+The app is currently wired to artifact `models/player_prop_artifacts_opp28.pt` and uses the opponent-context sequence setup.
 
-3. **Evaluation Beyond One Metric**
-Track MAE/RMSE/R2 plus interval width and empirical coverage.
+Target:
+1. `PTS`
 
-4. **Application Layer Design**
-Expose a clean service API and connect it to an interactive Streamlit front end.
+Feature groups used for training/inference:
+1. Context (3):
+1. `is_playoff`
+2. `home`
+3. `days_of_rest`
+2. Raw player sequence features (16):
+1. `MIN`
+2. `FGM`
+3. `FGA`
+4. `FG3M`
+5. `FG3A`
+6. `FTM`
+7. `FTA`
+8. `AST`
+9. `REB`
+10. `OREB`
+11. `DREB`
+12. `TOV`
+13. `STL`
+14. `BLK`
+15. `PF`
+16. `PLUS_MINUS`
+3. Opponent last-game context features (9):
+1. `Opp_LastGame_PTS`
+2. `Opp_LastGame_AST`
+3. `Opp_LastGame_REB`
+4. `Opp_LastGame_FGA`
+5. `Opp_LastGame_FG3A`
+6. `Opp_LastGame_TOV`
+7. `Opp_LastGame_STL`
+8. `Opp_LastGame_BLK`
+9. `Opp_LastGame_PLUS_MINUS`
 
-## Methods and Architecture
+Total active features: 28.
 
-### 1. Data Source (`nba_api`)
+## App Pages
 
-The pipeline uses `LeagueGameLog` for both:
-1. Player logs (`P`).
-2. Team logs (`T`).
+### 1) Predict Matchup
+1. Select home/away teams and playoff toggle.
+2. Preview official rosters for each team.
+3. Run model inference for both rosters.
+4. View full team forecasts side by side (not truncated to top-N).
 
-For each season in a configured range, it pulls:
-1. Regular season data.
-2. Playoff data.
+### 2) Betting Lines
+1. Reads `prize_picks_lines.csv` (required columns: `game_date`, `player_name`, `team`, `opponent`, `line`).
+2. Builds model recommendations (`over`, `under`, `push`) from `q50` vs line.
+3. Fetches completed game `PTS` automatically from `nba_api` (`LeagueGameFinder`) by date range.
+4. Scores picks as `correct`, `incorrect`, `pending`, or `push`.
+5. Displays:
+1. Pick cards ordered by biggest edge.
+2. Interval on cards using available quantile bounds.
+3. Edge and status charts.
+4. Cumulative accuracy chart.
+5. Detailed table in an expander.
 
-### 2. Feature Engineering (`src/data.py`)
+Notes:
+1. If API data is not available yet for a game, status remains `pending`.
+2. Optional CSV columns `actual_points` or `actual` can still serve as fallback values.
 
-The processing pipeline creates three outputs:
-1. `final_df`: model-ready training data.
-2. `current_players`: latest player feature snapshot for inference.
-3. `current_teams`: latest team/opponent context for inference.
+### 3) Test Stats
+1. Artifact metadata and split details.
+2. Headline error metrics on test rows.
+3. Calibration and interval diagnostics.
+4. Player-volume and outlier analyses.
 
-Key feature groups:
-1. Player rolling stats over 5 and 10 games (points, minutes, attempts, assists, rebounds, turnovers, percentages).
-2. Team rolling offense context.
-3. Opponent rolling defense context.
-4. Game context features: `home`, `is_playoff`, `days_of_rest`.
+## Caching and Performance
 
-Leakage prevention:
-1. Rolling features are shifted so each row uses only prior information at train time.
+The app uses multiple cache layers:
+1. Dataset cache (`st.cache_data`) for historical pulls and processed frames.
+2. Artifact cache (`st.cache_resource`) for loaded model artifacts.
+3. Betting prediction cache in session state to avoid recomputing repeated slate matchups.
+4. Cached completed-game stat pulls for date ranges.
 
-### Complete Model Feature List
+This means first load is the slowest; subsequent reruns are substantially faster.
 
-The model target is `PTS`.
-
-The model uses all non-ID, non-target columns at training time. In the current pipeline, that means the following **33 features**:
-
-| Feature | Short Description |
-| --- | --- |
-| `is_playoff` | `1` if playoff game, else `0` for regular season. |
-| `home` | `1` if player is at home, `0` if away. |
-| `days_of_rest` | Days since the player's previous game (capped in preprocessing). |
-| `Rolling_5G_Games_Played` | Number of games played in the player's last 5-game window. |
-| `Rolling_10G_Games_Played` | Number of games played in the player's last 10-game window. |
-| `Rolling_5G_MIN` | Player average minutes over last 5 games. |
-| `Rolling_10G_MIN` | Player average minutes over last 10 games. |
-| `Rolling_5G_PTS` | Player average points over last 5 games. |
-| `Rolling_10G_PTS` | Player average points over last 10 games. |
-| `Rolling_5G_FGA` | Player average field-goal attempts over last 5 games. |
-| `Rolling_10G_FGA` | Player average field-goal attempts over last 10 games. |
-| `Rolling_5G_FG_PCT` | Player rolling FG% over last 5 games. |
-| `Rolling_10G_FG_PCT` | Player rolling FG% over last 10 games. |
-| `Rolling_5G_FG3A` | Player average 3-point attempts over last 5 games. |
-| `Rolling_10G_FG3A` | Player average 3-point attempts over last 10 games. |
-| `Rolling_5G_FTA` | Player average free-throw attempts over last 5 games. |
-| `Rolling_10G_FTA` | Player average free-throw attempts over last 10 games. |
-| `Rolling_5G_AST` | Player average assists over last 5 games. |
-| `Rolling_10G_AST` | Player average assists over last 10 games. |
-| `Rolling_5G_REB` | Player average rebounds over last 5 games. |
-| `Rolling_10G_REB` | Player average rebounds over last 10 games. |
-| `Rolling_5G_TOV` | Player average turnovers over last 5 games. |
-| `Rolling_10G_TOV` | Player average turnovers over last 10 games. |
-| `Team_Rolling_5G_PTS` | Team average points scored over its last 5 games. |
-| `Team_Rolling_10G_PTS` | Team average points scored over its last 10 games. |
-| `Team_Rolling_5G_FGA` | Team average field-goal attempts over its last 5 games. |
-| `Team_Rolling_10G_FGA` | Team average field-goal attempts over its last 10 games. |
-| `Opp_Rolling_5G_opponentScore` | Opponent's recent points allowed proxy over last 5 games. |
-| `Opp_Rolling_10G_opponentScore` | Opponent's recent points allowed proxy over last 10 games. |
-| `Opp_Rolling_5G_STL` | Opponent average steals over last 5 games. |
-| `Opp_Rolling_10G_STL` | Opponent average steals over last 10 games. |
-| `Opp_Rolling_5G_BLK` | Opponent average blocks over last 5 games. |
-| `Opp_Rolling_10G_BLK` | Opponent average blocks over last 10 games. |
-
-Columns excluded from modeling:
-1. `GAME_ID`
-2. `GAME_DATE`
-3. `PLAYER_ID`
-4. `PLAYER_NAME`
-5. `TEAM_ID`
-6. `opponentTeamId`
-7. `PTS` (target)
-
-### 3. Model (`src/model.py`)
-
-`PlayerPropNN` is a feedforward neural network with dropout regularization and 3-output head:
-1. Output dimension = number of quantiles (`0.10`, `0.50`, `0.90`).
-
-`PinballLoss` is used for quantile regression.
-
-For a quantile `q`, target `y`, prediction `y_hat`:
-
-`L_q(y, y_hat) = max(q * (y - y_hat), (q - 1) * (y - y_hat))`
-
-Interpretation:
-1. Underestimation is penalized differently than overestimation.
-2. This asymmetry lets the model learn probabilistic bands instead of a single average.
-
-### 4. Service Layer (`src/service.py`)
-
-Core functions:
-1. `train_model(...)`: date-split training and artifact creation.
-2. `evaluate_test_set(...)`: test metrics and per-row predictions.
-3. `predict_matchup(...)`: home/away player projections.
-4. `get_matchup_rosters(...)`: roster preview before prediction.
-5. `team_lookup(...)`: team selector metadata.
-
-Roster logic:
-1. Official roster filtering is enforced through `CommonTeamRoster`.
-2. If roster API fails or mismatches occur, fallback is capped to a realistic roster size.
-3. Defensive dedupe by `PLAYER_ID` prevents duplicate player rows.
-
-## Streamlit App Workflow (`app.py`)
-
-The app now follows an automated setup workflow.
-
-### Startup (Automatic)
-1. Fetch and cache processed NBA data from `2020` to the current season.
-2. Load pre-trained model artifacts from `models/player_prop_artifacts.pt`.
-3. Compute and render test diagnostics (calibration, outlier behavior, and data-volume comparisons).
-4. Show artifact metadata (split date and train/test rows).
-
-### Predict Matchup
-1. Select home and away teams by name.
-2. Toggle playoffs flag.
-3. Review **official roster preview** for both teams.
-4. Calculate predictions.
-5. View player-level quantile tables for each team.
-
-### Evaluation Diagnostics (Automatic)
-The app now includes startup-computed evaluation components on the held-out test split:
-1. Headline metrics: `MAE`, `RMSE`, `R2` for `q50`.
-2. Per-quantile error table: `q10`, `q50`, `q90` for `MAE`, `RMSE`, `R2`.
-3. Empirical calibration plot: nominal quantile vs empirical coverage.
-4. Outlier summary: robust IQR-based outlier flags on `q50` residuals.
-5. Data-volume analysis: interval width (`q90-q10`) vs total games per player in the full dataset.
-6. Bucketed performance table for player history volume groups (`1-25`, `26-100`, `101+` total games).
-
-State behavior:
-1. Predictions are reset when matchup inputs change to avoid stale outputs.
-
-## Installation and Setup
+## Setup
 
 ### Prerequisites
+1. Python 3.10+
+2. Internet access for NBA API calls
 
-1. Python `3.10+` recommended.
-2. Internet access (required for NBA API requests).
-
-### 1. Clone Repository
-
-```bash
-git clone <your-repo-url>
-cd NBA-Prop-Forecasting-App
-```
-
-### 2. Create Virtual Environment
-
-macOS/Linux:
+### Install
 
 ```bash
-python3 -m venv env
-source env/bin/activate
-```
-
-Windows (PowerShell):
-
-```powershell
-python -m venv env
-.\env\Scripts\Activate.ps1
-```
-
-### 3. Install Dependencies
-
-```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Run the App
+### Run
 
 ```bash
 streamlit run app.py
 ```
 
-## Train/Refresh Model Artifact (Maintainer Workflow)
+## Train or Refresh Artifact
 
-The user-facing app does not train models. Maintainers refresh artifacts offline and save them to disk.
-
-Default behavior:
-1. Data window starts at `2020`.
-2. End year is rolling and includes the current season.
-3. Split date is fixed at `2024-06-18`.
+Use:
 
 ```bash
 python scripts/train_artifact.py
 ```
 
-Optional overrides:
+Current defaults in `scripts/train_artifact.py`:
+1. `--start-year 2020`
+2. `--end-year` rolls with current season
+3. `--split-date 2024-06-18`
+4. `--output models/player_prop_artifacts_opp28.pt`
+5. `--sequence-length 20`
+
+Example override:
 
 ```bash
-python scripts/train_artifact.py --start-year 2020 --end-year 2026 --split-date 2024-06-18 --output models/player_prop_artifacts.pt
+python scripts/train_artifact.py --start-year 2020 --end-year 2026 --split-date 2024-06-18 --output models/player_prop_artifacts_opp28.pt --sequence-length 20
 ```
 
-## Programmatic Usage (Optional)
-
-### Train and Save Artifact
-
-```python
-from src.data import get_nba_data
-from src.service import train_model, evaluate_test_set
-import torch
-
-train_df, current_players, current_teams = get_nba_data(start_year=2020, end_year=2026)
-
-artifacts = train_model(
-	 df=train_df,
-	 split_date="2024-06-18",
-	 max_epochs=200,
-	 early_stopping_patience=12,
-	 batch_size=256,
-	 learning_rate=1e-3,
-)
-
-test_eval = evaluate_test_set(df=train_df, artifacts=artifacts)
-print(test_eval.summary)
-torch.save(artifacts, "models/player_prop_artifacts.pt")
-```
-
-### Predict Matchup
-
-```python
-from src.service import predict_matchup, team_lookup
-
-teams = team_lookup(current_teams)
-home_team_id = int(teams.iloc[0]["TEAM_ID"])
-away_team_id = int(teams.iloc[1]["TEAM_ID"])
-
-predictions = predict_matchup(
-	 artifacts=artifacts,
-	 current_players=current_players,
-	 current_teams=current_teams,
-	 home_team_id=home_team_id,
-	 away_team_id=away_team_id,
-	 is_playoff=False,
-	 enforce_official_roster=True,
-)
-
-print(predictions.head())
-```
-
-## Repository Structure
+## Repository Layout
 
 ```text
-NBA-Proposition-Forecasting-App/
-|- app.py                    # Streamlit dashboard
-|- requirements.txt          # Python dependencies
-|- LICENSE
-|- README.md
+NBA-Prop-Forecasting-App/
+|- app.py
+|- prize_picks_lines.csv
+|- requirements.txt
+|- scripts/
+|  |- train_artifact.py
 |- src/
-|  |- data.py                # Data ingestion + feature engineering
-|  |- model.py               # Quantile model + pinball loss
-|  |- service.py             # Train/eval/predict service layer
+|  |- data.py
+|  |- model.py
+|  |- service.py
+|- models/
+|  |- player_prop_artifacts_opp28.pt   # expected at runtime
 ```
 
-## Metrics and Interpretation Notes
+## Known Limitations
 
-1. `MAE (q50)` and `RMSE (q50)` measure median-forecast point error.
-2. `R2 (q50)` shows explained variance for median predictions.
-3. `Interval Width (q10-q90)` captures uncertainty spread.
-4. `Coverage (q10-q90)` estimates how often true outcomes fall inside the predicted band.
-
-Practical interpretation:
-1. Narrow intervals with low coverage can indicate overconfidence.
-2. Very wide intervals with high coverage can indicate underconfident forecasts.
-
-## Troubleshooting
-
-1. **NBA API rate/network issues**
-	1. Retry after a short wait.
-	2. Ensure stable internet.
-	3. Reduce year range while testing.
-
-2. **Long data load times**
-	1. Multi-season pulls are expensive.
-	2. Start with narrower windows for iteration.
-
-3. **Roster oddities**
-	1. App enforces official roster filtering.
-	2. If API lookup fails, capped fallback logic is used.
-
-4. **Reproducibility differences**
-	1. Neural network training is stochastic (shuffle/dropout).
-	2. Small metric variation across runs is expected.
+1. Name matching between CSV lines and NBA API box scores is normalization-based and can still miss rare aliases.
+2. Team/opponent abbreviations in CSV must map to NBA abbreviations present in `current_teams`.
+3. NBA API latency/rate limits can delay updates or produce temporary fetch failures.
+4. Model quality depends on artifact freshness and selected feature schema.
 
 ## License
 
-This project is distributed under the terms in `LICENSE`.
+See `LICENSE`.

@@ -4,7 +4,7 @@ This module provides a single public pipeline function, ``get_nba_data``, that
 returns:
 1. Historical training data with leakage-safe shifted player features.
 2. Current player feature state for inference.
-3. Current team metadata for inference/UI.
+3. Current team metadata + last-game context for inference/UI.
 """
 
 from __future__ import annotations
@@ -40,7 +40,27 @@ RAW_PLAYER_SEQUENCE_COLS: tuple[str, ...] = (
 
 PLAYER_INFERENCE_COLS: tuple[str, ...] = ()
 
-TEAM_INFERENCE_COLS: tuple[str, ...] = ()
+RAW_TEAM_PERFORMANCE_COLS: tuple[str, ...] = (
+    "PTS",
+    "AST",
+    "REB",
+    "FGA",
+    "FG3A",
+    "TOV",
+    "STL",
+    "BLK",
+    "PLUS_MINUS",
+)
+
+TEAM_LAST_GAME_COLS: tuple[str, ...] = tuple(
+    f"Team_LastGame_{col}" for col in RAW_TEAM_PERFORMANCE_COLS
+)
+
+OPP_LAST_GAME_COLS: tuple[str, ...] = tuple(
+    f"Opp_LastGame_{col}" for col in RAW_TEAM_PERFORMANCE_COLS
+)
+
+TEAM_INFERENCE_COLS: tuple[str, ...] = OPP_LAST_GAME_COLS
 
 
 def _season_strings(start_year: int, end_year: int) -> list[str]:
@@ -132,7 +152,24 @@ def get_nba_data(
     df["days_of_rest"] = df.groupby("PLAYER_ID")["GAME_DATE"].diff().dt.days
     df["days_of_rest"] = df["days_of_rest"].fillna(10).clip(upper=10)
 
-    final_df = df.copy()
+    teams_sorted = teams_raw.sort_values(by=["TEAM_ID", "GAME_DATE", "GAME_ID"]).reset_index(drop=True)
+    for raw_col, team_col in zip(RAW_TEAM_PERFORMANCE_COLS, TEAM_LAST_GAME_COLS):
+        teams_sorted[team_col] = teams_sorted.groupby("TEAM_ID")[raw_col].shift(1)
+
+    team_profiles = teams_sorted[["GAME_ID", "TEAM_ID", *TEAM_LAST_GAME_COLS]].copy()
+    matchup_profiles = pd.merge(
+        team_profiles,
+        team_profiles,
+        on="GAME_ID",
+        suffixes=("", "_OPP"),
+    )
+    matchup_profiles = matchup_profiles[matchup_profiles["TEAM_ID"] != matchup_profiles["TEAM_ID_OPP"]].copy()
+
+    for team_col, opp_col in zip(TEAM_LAST_GAME_COLS, OPP_LAST_GAME_COLS):
+        matchup_profiles[opp_col] = matchup_profiles[f"{team_col}_OPP"]
+
+    matchup_profiles = matchup_profiles[["GAME_ID", "TEAM_ID", *TEAM_INFERENCE_COLS]].copy()
+    final_df = pd.merge(df, matchup_profiles, on=["GAME_ID", "TEAM_ID"], how="left")
 
     columns_of_interest = [
         "GAME_ID",
@@ -155,9 +192,10 @@ def get_nba_data(
     final_df = final_df.reset_index(drop=True)
 
     current_players = df[df["GAME_DATE"] >= MIN_MODEL_DATE].groupby("PLAYER_ID").tail(1).copy()
-    current_teams = teams_raw[teams_raw["GAME_DATE"] >= MIN_MODEL_DATE].groupby("TEAM_ID").tail(1).copy()
+    current_teams = teams_sorted[teams_sorted["GAME_DATE"] >= MIN_MODEL_DATE].groupby("TEAM_ID").tail(1).copy()
 
     player_context_cols = [
+        "GAME_DATE",
         "PLAYER_ID",
         "PLAYER_NAME",
         "TEAM_ID",
@@ -171,7 +209,8 @@ def get_nba_data(
     for optional_col in ("TEAM_ABBREVIATION", "TEAM_NAME"):
         if optional_col in current_teams.columns:
             team_meta_cols.append(optional_col)
-    current_teams = current_teams[team_meta_cols].copy()
+    current_team_context_cols = [col for col in TEAM_LAST_GAME_COLS if col in current_teams.columns]
+    current_teams = current_teams[[*team_meta_cols, *current_team_context_cols]].copy()
 
     return final_df, current_players.reset_index(drop=True), current_teams.reset_index(drop=True)
 
@@ -180,6 +219,9 @@ __all__ = [
     "DEFAULT_START_YEAR",
     "DEFAULT_END_YEAR",
     "RAW_PLAYER_SEQUENCE_COLS",
+    "RAW_TEAM_PERFORMANCE_COLS",
+    "TEAM_LAST_GAME_COLS",
+    "OPP_LAST_GAME_COLS",
     "PLAYER_INFERENCE_COLS",
     "TEAM_INFERENCE_COLS",
     "fetch_nba_api_data",
