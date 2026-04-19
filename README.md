@@ -15,6 +15,8 @@ It predicts uncertainty-aware outcomes with a transformer quantile model and inc
 2. `Betting Lines`
 3. `Test Stats`
 6. Betting page grades picks using completed game stats fetched automatically from `nba_api`.
+7. Recommendation labels for a user-facing betting baseline: `solid`, `moderate`, `fair`, `lose`.
+8. Optional live line ingestion from The Odds API, with CSV fallback.
 
 ### What is no longer the current setup
 1. Legacy rolling-feature-only schema.
@@ -95,11 +97,12 @@ Total active features: 28.
 4. View full team forecasts side by side (not truncated to top-N).
 
 ### 2) Betting Lines
-1. Reads `prize_picks_lines.csv` (required columns: `game_date`, `player_name`, `team`, `opponent`, `line`).
+1. Reads `prize_picks_lines.csv` or fetches live player-points lines from The Odds API.
 2. Builds model recommendations (`over`, `under`, `push`) from `q50` vs line.
-3. Fetches completed game `PTS` automatically from `nba_api` (`LeagueGameFinder`) by date range.
-4. Scores picks as `correct`, `incorrect`, `pending`, or `push`.
-5. Displays:
+3. Adds a user-facing confidence label (`solid`, `moderate`, `fair`, `lose`) from the model interval and line edge.
+4. Fetches completed game `PTS` automatically from `nba_api` (`LeagueGameFinder`) by date range.
+5. Scores picks as `correct`, `incorrect`, `pending`, or `push`.
+6. Displays:
 1. Pick cards ordered by biggest edge.
 2. Interval on cards using available quantile bounds.
 3. Edge and status charts.
@@ -109,6 +112,8 @@ Total active features: 28.
 Notes:
 1. If API data is not available yet for a game, status remains `pending`.
 2. Optional CSV columns `actual_points` or `actual` can still serve as fallback values.
+3. Set `ODDS_API_KEY` if you want the app to fetch live player-points lines.
+4. Live Odds API snapshots are appended to `data/betting_line_history.csv` to support future calibration and backtesting.
 
 ### 3) Test Stats
 1. Artifact metadata and split details.
@@ -144,6 +149,29 @@ pip install -r requirements.txt
 
 ```bash
 streamlit run app.py
+```
+
+Optional live odds:
+
+```bash
+export ODDS_API_KEY=your_api_key_here
+streamlit run app.py
+```
+
+### Export a Fresh Betting Baseline
+
+Use the included script to create a CSV snapshot in the same schema the app already expects:
+
+```bash
+python scripts/fetch_betting_lines.py --output prize_picks_lines.csv
+```
+
+By default, the script also appends the same fetch to `data/betting_line_history.csv`.
+
+You can also target a dated file:
+
+```bash
+python scripts/fetch_betting_lines.py --output data/betting_lines_$(date +%F).csv
 ```
 
 ## Train or Refresh Artifact

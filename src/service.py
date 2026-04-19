@@ -13,6 +13,7 @@ import copy
 from dataclasses import dataclass
 from datetime import date, datetime
 from functools import lru_cache
+import math
 from typing import Any
 
 import numpy as np
@@ -562,17 +563,82 @@ def _build_inference_sequence(
     return seq, pad_mask
 
 
+def _history_interval_scale(
+    total_history_games: int,
+    sequence_history_games: int,
+    reference_games: int,
+) -> float:
+    """Return a monotonic interval scale based on player history depth.
+
+    The transformer only directly sees a capped sequence window, so this
+    post-hoc factor lets intervals still respond to a player's deeper history.
+    More total games -> slightly tighter intervals.
+    Fewer games -> slightly wider intervals.
+    """
+    effective_total = max(int(total_history_games), 1)
+    effective_seq = max(int(sequence_history_games), 1)
+    effective_ref = max(int(reference_games), 1)
+
+    total_factor = (effective_ref / effective_total) ** 0.16
+    seq_factor = (effective_ref / effective_seq) ** 0.08
+    scale = total_factor * seq_factor
+    return float(np.clip(scale, 0.72, 1.35))
+
+
+def _apply_history_interval_calibration(
+    preds: np.ndarray,
+    quantiles: tuple[float, ...],
+    total_history_games: list[int],
+    sequence_history_games: list[int],
+    reference_games: int,
+) -> np.ndarray:
+    """Shrink or widen prediction intervals around the median by history depth."""
+    if preds.size == 0 or len(quantiles) < 3:
+        return preds
+
+    calibrated = preds.copy()
+    try:
+        median_idx = int(np.argmin(np.abs(np.array(quantiles) - 0.5)))
+    except Exception:
+        return calibrated
+
+    lower_idxs = [idx for idx, q in enumerate(quantiles) if q < 0.5]
+    upper_idxs = [idx for idx, q in enumerate(quantiles) if q > 0.5]
+    if not lower_idxs or not upper_idxs:
+        return calibrated
+
+    for row_idx in range(calibrated.shape[0]):
+        center = float(calibrated[row_idx, median_idx])
+        scale = _history_interval_scale(
+            total_history_games=total_history_games[row_idx],
+            sequence_history_games=sequence_history_games[row_idx],
+            reference_games=reference_games,
+        )
+        for idx in lower_idxs:
+            delta = center - float(calibrated[row_idx, idx])
+            calibrated[row_idx, idx] = center - (delta * scale)
+        for idx in upper_idxs:
+            delta = float(calibrated[row_idx, idx]) - center
+            calibrated[row_idx, idx] = center + (delta * scale)
+
+    return calibrated
+
+
 def _predict_from_features(
     feature_df: pd.DataFrame,
     current_history_df: pd.DataFrame,
     artifacts: ModelArtifacts,
-) -> np.ndarray:
-    """Run model inference on 20-step player histories and return quantile predictions."""
+) -> tuple[np.ndarray, list[int], list[int], list[float]]:
+    """Run model inference and return predictions plus history-depth metadata."""
     seq_len = int(getattr(artifacts, "sequence_length", DEFAULT_SEQUENCE_LENGTH))
     feature_cols = artifacts.feature_columns
+    sequence_history_cap = max(seq_len - 1, 1)
 
     seq_batch: list[np.ndarray] = []
     mask_batch: list[np.ndarray] = []
+    total_history_games: list[int] = []
+    sequence_history_games: list[int] = []
+    interval_scales: list[float] = []
     for _, current_row in feature_df.iterrows():
         player_id = current_row["PLAYER_ID"]
         history_rows = current_history_df[
@@ -580,6 +646,8 @@ def _predict_from_features(
             & (current_history_df["GAME_DATE"] < current_row["GAME_DATE"])
         ].copy()
         history_rows = history_rows.sort_values(by=["GAME_DATE", "GAME_ID"]).reset_index(drop=True)
+        total_games = int(len(history_rows))
+        seq_games = int(min(total_games, sequence_history_cap))
 
         # Match train-time scaling for both history tokens and the current matchup token.
         history_rows_norm = _normalized_features(history_rows, artifacts=artifacts)
@@ -588,9 +656,18 @@ def _predict_from_features(
         seq, pad_mask = _build_inference_sequence(history_rows_norm, current_row_norm, artifacts)
         seq_batch.append(seq)
         mask_batch.append(pad_mask)
+        total_history_games.append(total_games)
+        sequence_history_games.append(seq_games)
+        interval_scales.append(
+            _history_interval_scale(
+                total_history_games=total_games,
+                sequence_history_games=seq_games,
+                reference_games=sequence_history_cap,
+            )
+        )
 
     if not seq_batch:
-        return np.empty((0, len(artifacts.quantiles)), dtype=np.float32)
+        return np.empty((0, len(artifacts.quantiles)), dtype=np.float32), [], [], []
 
     seq_tensor = _to_tensor(np.stack(seq_batch, axis=0))
     mask_tensor = torch.tensor(np.stack(mask_batch, axis=0), dtype=torch.bool)
@@ -600,7 +677,14 @@ def _predict_from_features(
             seq_tensor,
             padding_mask=mask_tensor,
         ).numpy()
-    return preds
+    preds = _apply_history_interval_calibration(
+        preds=preds,
+        quantiles=artifacts.quantiles,
+        total_history_games=total_history_games,
+        sequence_history_games=sequence_history_games,
+        reference_games=sequence_history_cap,
+    )
+    return preds, total_history_games, sequence_history_games, interval_scales
 
 
 def _predict_test_set_with_transformer(
@@ -673,8 +757,16 @@ def predict_matchup(
         home_flag=0,
     )
 
-    home_preds = _predict_from_features(home_features, current_history_df=history_df, artifacts=artifacts)
-    away_preds = _predict_from_features(away_features, current_history_df=history_df, artifacts=artifacts)
+    home_preds, home_total_games, home_seq_games, home_scales = _predict_from_features(
+        home_features,
+        current_history_df=history_df,
+        artifacts=artifacts,
+    )
+    away_preds, away_total_games, away_seq_games, away_scales = _predict_from_features(
+        away_features,
+        current_history_df=history_df,
+        artifacts=artifacts,
+    )
 
     pred_cols = [f"q{int(q * 100)}" for q in artifacts.quantiles]
 
@@ -684,6 +776,13 @@ def predict_matchup(
     for idx, col in enumerate(pred_cols):
         home_out[col] = home_preds[:, idx]
         away_out[col] = away_preds[:, idx]
+
+    home_out["history_games"] = home_total_games
+    away_out["history_games"] = away_total_games
+    home_out["sequence_history_games"] = home_seq_games
+    away_out["sequence_history_games"] = away_seq_games
+    home_out["interval_scale"] = home_scales
+    away_out["interval_scale"] = away_scales
 
     output = pd.concat([home_out, away_out], ignore_index=True)
     output["is_playoff"] = int(is_playoff)

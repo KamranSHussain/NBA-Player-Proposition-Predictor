@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import string
 import unicodedata
@@ -15,6 +16,13 @@ import streamlit as st
 import torch
 from nba_api.stats.endpoints import leaguegamefinder
 
+from src.betting import (
+    append_line_history_snapshot,
+    attach_recommendation_columns,
+    build_player_team_abbreviation_map,
+    fetch_the_odds_api_player_points_lines,
+    normalize_player_name,
+)
 from src.data import get_nba_data
 from src.service import (
     evaluate_test_set,
@@ -226,14 +234,7 @@ def _build_team_name_map(teams_df: pd.DataFrame) -> dict[int, str]:
 
 def _normalize_player_name(name: object) -> str:
     """Normalize player names for robust joins."""
-    if pd.isna(name):
-        return ""
-    value = unicodedata.normalize("NFKD", str(name))
-    value = value.encode("ascii", "ignore").decode("ascii")
-    value = value.lower()
-    value = value.translate(str.maketrans("", "", string.punctuation))
-    value = re.sub(r"\s+", " ", value).strip()
-    return value
+    return normalize_player_name(name)
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 10)
@@ -243,6 +244,25 @@ def load_betting_lines_csv(csv_path: str) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing betting lines file at '{path}'.")
     return pd.read_csv(path)
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 10)
+def load_live_betting_lines(
+    api_key: str,
+    player_team_map_items: tuple[tuple[str, str], ...],
+    regions: str = "us",
+    market: str = "player_points",
+    commence_days: int = 3,
+) -> pd.DataFrame:
+    """Fetch live player-points lines from The Odds API and cache the result."""
+    player_team_map = dict(player_team_map_items)
+    return fetch_the_odds_api_player_points_lines(
+        api_key=api_key,
+        player_team_map=player_team_map,
+        regions=regions,
+        market=market,
+        commence_days=commence_days,
+    )
 
 
 def _build_team_abbreviation_map(teams_df: pd.DataFrame) -> dict[str, int]:
@@ -320,6 +340,7 @@ def _ensure_state_defaults() -> None:
     st.session_state.setdefault("latest_predictions", None)
     st.session_state.setdefault("last_matchup_key", None)
     st.session_state.setdefault("betting_preds_cache", {})
+    st.session_state.setdefault("logged_live_line_snapshots", set())
 
 
 _ensure_state_defaults()
@@ -368,19 +389,58 @@ train_df: pd.DataFrame = st.session_state.train_df
 current_players: pd.DataFrame = st.session_state.current_players
 current_teams: pd.DataFrame = st.session_state.current_teams
 artifacts = st.session_state.artifacts
+player_team_map_items = tuple(
+    sorted(build_player_team_abbreviation_map(current_players, current_teams).items())
+)
+odds_api_key = os.getenv("ODDS_API_KEY", "").strip()
 
 summary = model_summary(artifacts)
 
 if page == "Betting Lines":
     st.divider()
     st.subheader("Betting Lines Command Center")
-    st.caption("Lines are loaded from CSV. Completed-game actuals are fetched automatically from nba_api.")
+    st.caption(
+        "Use a CSV snapshot or a live Odds API feed for baseline lines. Completed-game actuals are fetched automatically from nba_api."
+    )
 
-    try:
-        lines_df = load_betting_lines_csv(str(BETTING_LINES_PATH)).copy()
-    except Exception as exc:
-        st.error(f"Could not load betting lines CSV: {exc}")
-        st.stop()
+    source_options = ["CSV snapshot"]
+    default_source_index = 0
+    if odds_api_key:
+        source_options.insert(0, "Live Odds API")
+    source_mode = st.radio("Line Source", options=source_options, horizontal=True, index=default_source_index)
+
+    if source_mode == "Live Odds API":
+        try:
+            with st.spinner("Fetching live player-points lines..."):
+                lines_df = load_live_betting_lines(
+                    api_key=odds_api_key,
+                    player_team_map_items=player_team_map_items,
+                ).copy()
+        except Exception as exc:
+            st.error(f"Could not fetch live Odds API lines: {exc}")
+            st.stop()
+        if lines_df.empty:
+            st.warning("The live Odds API request returned no upcoming player-points lines in the current window.")
+            st.stop()
+        live_snapshot_cols = [col for col in ["game_date", "player_name", "team", "opponent", "line", "market"] if col in lines_df.columns]
+        live_snapshot_key = "||".join(
+            lines_df[live_snapshot_cols]
+            .sort_values(live_snapshot_cols)
+            .astype(str)
+            .agg("|".join, axis=1)
+            .tolist()
+        )
+        if live_snapshot_key and live_snapshot_key not in st.session_state.logged_live_line_snapshots:
+            history_path = append_line_history_snapshot(lines_df)
+            st.session_state.logged_live_line_snapshots.add(live_snapshot_key)
+            if history_path is not None:
+                st.caption(f"Logged this live snapshot to `{history_path}` for future calibration.")
+    else:
+        try:
+            lines_df = load_betting_lines_csv(str(BETTING_LINES_PATH)).copy()
+        except Exception as exc:
+            st.error(f"Could not load betting lines CSV: {exc}")
+            st.stop()
 
     required_cols = {"game_date", "player_name", "team", "opponent", "line"}
     missing_cols = sorted(required_cols - set(lines_df.columns))
@@ -506,12 +566,17 @@ if page == "Betting Lines":
         how="left",
         on=["game_day", "team_id", "player_key"],
     )
-
-    scored["model_recommendation"] = "pending"
-    known_pred_mask = scored["q50"].notna() & scored["line"].notna()
-    scored.loc[known_pred_mask & (scored["q50"] > scored["line"]), "model_recommendation"] = "over"
-    scored.loc[known_pred_mask & (scored["q50"] < scored["line"]), "model_recommendation"] = "under"
-    scored.loc[known_pred_mask & (scored["q50"] == scored["line"]), "model_recommendation"] = "push"
+    scored_quant_cols = _sorted_quantile_columns(scored)
+    interval_low_col = scored_quant_cols[0] if len(scored_quant_cols) >= 2 else None
+    interval_high_col = scored_quant_cols[-1] if len(scored_quant_cols) >= 2 else None
+    scored = attach_recommendation_columns(
+        scored,
+        q50_col="q50",
+        line_col="line",
+        q_low_col=interval_low_col,
+        q_high_col=interval_high_col,
+    )
+    scored["model_recommendation"] = scored["bet_side"]
 
     # Pull official completed-game points from nba_api for each date represented in the lines file.
     unique_days = sorted(scored["game_day"].dropna().dt.strftime("%Y-%m-%d").unique().tolist())
@@ -573,11 +638,7 @@ if page == "Betting Lines":
     graded_picks = int(graded_mask.sum())
     correct_picks = int((scored["status"] == "correct").sum())
     accuracy_pct = (100.0 * correct_picks / graded_picks) if graded_picks > 0 else None
-    scored["edge"] = scored["q50"] - scored["line"]
-    scored["confidence"] = scored["edge"].abs()
-    scored_quant_cols = _sorted_quantile_columns(scored)
-    interval_low_col = scored_quant_cols[0] if len(scored_quant_cols) >= 2 else None
-    interval_high_col = scored_quant_cols[-1] if len(scored_quant_cols) >= 2 else None
+    scored["confidence"] = scored["confidence_score"].fillna(0.0)
     if interval_low_col and interval_high_col:
         scored["interval"] = (
             scored[interval_low_col].map(lambda x: f"{x:.1f}" if pd.notna(x) else "N/A")
@@ -597,6 +658,7 @@ if page == "Betting Lines":
         cols = st.columns(3)
         for i, row in card_df.iterrows():
             pick = str(row.get("model_recommendation", "pending")).upper()
+            label_txt = str(row.get("bet_label", "lose")).upper()
             status = str(row.get("status", "pending")).upper()
             if row.get("status") == "correct":
                 border = "#16a34a"
@@ -604,6 +666,15 @@ if page == "Betting Lines":
             elif row.get("status") == "incorrect":
                 border = "#dc2626"
                 badge_bg = "rgba(220, 38, 38, 0.2)"
+            elif row.get("bet_label") == "solid":
+                border = "#22c55e"
+                badge_bg = "rgba(34, 197, 94, 0.18)"
+            elif row.get("bet_label") == "moderate":
+                border = "#f97316"
+                badge_bg = "rgba(249, 115, 22, 0.2)"
+            elif row.get("bet_label") == "fair":
+                border = "#eab308"
+                badge_bg = "rgba(234, 179, 8, 0.18)"
             elif row.get("model_recommendation") in {"over", "under"}:
                 border = "#f97316"
                 badge_bg = "rgba(249, 115, 22, 0.2)"
@@ -622,6 +693,7 @@ if page == "Betting Lines":
             q_high_val = row.get(interval_high_col) if interval_high_col else None
             edge_val = row.get("edge")
             actual_val = row.get("actual_value")
+            confidence_pct = row.get("confidence_pct")
 
             line_txt = f"{float(line_val):.1f}" if pd.notna(line_val) else "N/A"
             q50_txt = f"{float(q50_val):.1f}" if pd.notna(q50_val) else "N/A"
@@ -632,6 +704,7 @@ if page == "Betting Lines":
             )
             edge_txt = f"{float(edge_val):+.1f}" if pd.notna(edge_val) else "N/A"
             actual_txt = f"{float(actual_val):.1f}" if pd.notna(actual_val) else "pending"
+            confidence_txt = f"{float(confidence_pct):.1f}%" if pd.notna(confidence_pct) else "N/A"
 
             cols[i % 3].markdown(
                 f"""
@@ -655,7 +728,10 @@ if page == "Betting Lines":
   </div>
     <div style="margin-top:0.35rem;font-size:0.78rem;color:#cbd5e1;">Interval ({interval_low_col or 'N/A'}-{interval_high_col or 'N/A'}): <b>{interval_txt}</b></div>
   <div style="margin-top:0.45rem;display:flex;justify-content:space-between;align-items:center;">
-    <div style="font-size:0.76rem;color:#cbd5e1;">Pick: <b>{pick}</b></div>
+    <div style="font-size:0.76rem;color:#cbd5e1;">Pick: <b>{pick}</b> | Label: <b>{label_txt}</b></div>
+    <div style="font-size:0.76rem;color:#cbd5e1;">Confidence: <b>{confidence_txt}</b></div>
+  </div>
+  <div style="margin-top:0.2rem;display:flex;justify-content:space-between;align-items:center;">
     <div style="font-size:0.76rem;color:#cbd5e1;">Actual PTS: <b>{actual_txt}</b></div>
   </div>
 </div>
@@ -750,9 +826,14 @@ if page == "Betting Lines":
         interval_high_col if interval_high_col else "q90",
         "interval",
         "model_recommendation",
+        "bet_label",
+        "confidence_pct",
         "actual_value",
         "actual_side",
         "status",
+        "sportsbook_count",
+        "sportsbooks",
+        "source",
     ]
     sort_cols = [col for col in ["confidence", "game_date", "team", "player_name"] if col in scored.columns]
     sorted_scored = scored.sort_values(sort_cols, ascending=[False, True, True, True][: len(sort_cols)]) if sort_cols else scored
@@ -1003,7 +1084,14 @@ if st.session_state.latest_predictions is not None:
         home_preds = home_preds.sort_values(q50_col, ascending=False)
         away_preds = away_preds.sort_values(q50_col, ascending=False)
 
-    show_cols = ["PLAYER_NAME", *quantile_cols, "interval_width"]
+    show_cols = [
+        "PLAYER_NAME",
+        *quantile_cols,
+        "interval_width",
+        "history_games",
+        "sequence_history_games",
+        "interval_scale",
+    ]
 
     st.markdown("#### Full Team Forecasts")
     fc1, fc2 = st.columns(2)
@@ -1013,3 +1101,123 @@ if st.session_state.latest_predictions is not None:
     with fc2:
         st.markdown(f"##### {away_label}")
         st.dataframe(away_preds[show_cols].reset_index(drop=True), use_container_width=True, hide_index=True, height=520)
+
+    st.markdown("#### Single-Player Bet Recommendation")
+    selector_team_options = [int(home_team_id), int(away_team_id)]
+    rc1, rc2, rc3 = st.columns([1.2, 1.6, 1.2])
+    with rc1:
+        selected_team_id = st.selectbox(
+            "Recommendation Team",
+            options=selector_team_options,
+            format_func=lambda tid: home_label if int(tid) == int(home_team_id) else away_label,
+        )
+
+    selected_team_preds = prediction_df[prediction_df["TEAM_ID"] == int(selected_team_id)].copy()
+    selected_team_preds = selected_team_preds.sort_values(q50_col, ascending=False) if q50_col else selected_team_preds
+    player_options = selected_team_preds["PLAYER_NAME"].dropna().tolist()
+
+    with rc2:
+        selected_player = st.selectbox("Player", options=player_options)
+
+    live_line_default = None
+    live_line_context = ""
+    line_source_options = ["Manual line"]
+    if odds_api_key:
+        line_source_options.insert(0, "Live Odds API line")
+
+    with rc3:
+        line_source = st.selectbox("Baseline Source", options=line_source_options)
+
+    if line_source == "Live Odds API line":
+        try:
+            live_lines_df = load_live_betting_lines(
+                api_key=odds_api_key,
+                player_team_map_items=player_team_map_items,
+            ).copy()
+        except Exception as exc:
+            live_lines_df = pd.DataFrame()
+            st.warning(f"Live odds lookup failed: {exc}")
+
+        if not live_lines_df.empty:
+            selected_team_abbr = current_teams.loc[
+                current_teams["TEAM_ID"] == int(selected_team_id), "TEAM_ABBREVIATION"
+            ].astype(str).str.upper().tolist()
+            selected_opponent_abbr = away_preds["TEAM_ID"].iloc[0] if int(selected_team_id) == int(home_team_id) else home_preds["TEAM_ID"].iloc[0]
+            opponent_abbr_lookup = current_teams.loc[
+                current_teams["TEAM_ID"] == int(selected_opponent_abbr), "TEAM_ABBREVIATION"
+            ].astype(str).str.upper().tolist()
+            player_key = _normalize_player_name(selected_player)
+            live_match = live_lines_df[
+                live_lines_df["player_key"].eq(player_key)
+                & live_lines_df["team"].isin(selected_team_abbr)
+                & live_lines_df["opponent"].isin(opponent_abbr_lookup)
+            ].sort_values("game_date")
+            if not live_match.empty:
+                live_line_default = float(live_match.iloc[0]["line"])
+                live_line_context = (
+                    f"Live baseline from {int(live_match.iloc[0]['sportsbook_count'])} sportsbook(s): "
+                    f"{live_match.iloc[0]['sportsbooks']}"
+                )
+            else:
+                st.info("No live line was found for that player in the current matchup window, so you can enter one manually.")
+
+    selected_player_row = selected_team_preds[selected_team_preds["PLAYER_NAME"] == selected_player].head(1).copy()
+    fallback_line = float(selected_player_row[q50_col].iloc[0]) if q50_col and not selected_player_row.empty else 0.0
+    baseline_line = st.number_input(
+        "Sportsbook line",
+        min_value=0.0,
+        value=float(live_line_default if live_line_default is not None else fallback_line),
+        step=0.5,
+    )
+
+    recommendation_df = selected_player_row.copy()
+    recommendation_df["line"] = float(baseline_line)
+    recommendation_df = attach_recommendation_columns(
+        recommendation_df,
+        q50_col=q50_col or "q50",
+        line_col="line",
+        q_low_col=q10_col,
+        q_high_col=q90_col,
+    )
+
+    if not recommendation_df.empty:
+        rec_row = recommendation_df.iloc[0]
+        interval_txt = "N/A"
+        if q10_col and q90_col and pd.notna(rec_row.get(q10_col)) and pd.notna(rec_row.get(q90_col)):
+            interval_txt = f"{float(rec_row[q10_col]):.1f} - {float(rec_row[q90_col]):.1f}"
+
+        if live_line_context:
+            st.caption(live_line_context)
+
+        st.markdown(
+            f"""
+<div style="
+    border: 1px solid #334155;
+    border-left: 6px solid #22c55e;
+    border-radius: 14px;
+    padding: 0.9rem 1rem;
+    margin-top: 0.3rem;
+    background: linear-gradient(180deg, rgba(15,23,42,0.92), rgba(17,27,47,0.94));
+">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:0.75rem;">
+    <div>
+      <div style="font-size:0.78rem;color:#94a3b8;letter-spacing:0.06em;">USER-ORIENTED RECOMMENDATION</div>
+      <div style="font-size:1.35rem;font-family:'Teko',sans-serif;color:#f8fafc;">{selected_player}</div>
+    </div>
+    <div style="font-size:0.82rem;padding:0.2rem 0.55rem;border-radius:999px;background:rgba(34,197,94,0.16);color:#dcfce7;">
+      {str(rec_row.get('bet_label', 'lose')).upper()}
+    </div>
+  </div>
+  <div style="margin-top:0.5rem;display:grid;grid-template-columns:repeat(5,1fr);gap:0.5rem;font-size:0.82rem;">
+    <div><span style="color:#94a3b8;">Recommended side</span><br><b style="color:#f8fafc;">{str(rec_row.get('bet_side', 'pending')).upper()}</b></div>
+    <div><span style="color:#94a3b8;">Sportsbook line</span><br><b style="color:#f8fafc;">{float(rec_row['line']):.1f}</b></div>
+    <div><span style="color:#94a3b8;">Model q50</span><br><b style="color:#f8fafc;">{float(rec_row[q50_col]):.1f}</b></div>
+    <div><span style="color:#94a3b8;">Edge</span><br><b style="color:#f8fafc;">{float(rec_row.get('edge', 0.0)):+.1f}</b></div>
+    <div><span style="color:#94a3b8;">Confidence</span><br><b style="color:#f8fafc;">{float(rec_row.get('confidence_pct', 0.0)):.1f}%</b></div>
+  </div>
+  <div style="margin-top:0.45rem;font-size:0.8rem;color:#cbd5e1;">Model interval: <b>{interval_txt}</b></div>
+  <div style="margin-top:0.2rem;font-size:0.78rem;color:#cbd5e1;">History games: <b>{int(rec_row.get('history_games', 0))}</b> | Sequence games used: <b>{int(rec_row.get('sequence_history_games', 0))}</b> | Interval scale: <b>{float(rec_row.get('interval_scale', 1.0)):.2f}x</b></div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
