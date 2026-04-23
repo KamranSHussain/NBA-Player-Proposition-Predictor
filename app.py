@@ -13,7 +13,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import torch
-from nba_api.stats.endpoints import leaguegamefinder
+from nba_api.stats.endpoints import leaguegamefinder, scoreboardv2
 
 from src.data import get_nba_data
 from src.fanduel_live import fetch_fanduel_live_player_points
@@ -307,6 +307,73 @@ def load_fanduel_live_lines(region: str, max_events: int) -> pd.DataFrame:
     return fetch_fanduel_live_player_points(region=region, max_events=max_events)
 
 
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def _load_scoreboard_games_for_date(date_mm_dd_yyyy: str) -> pd.DataFrame:
+    """Load NBA scoreboard rows for one date; returns empty frame on failure."""
+    try:
+        frames = scoreboardv2.ScoreboardV2(game_date=date_mm_dd_yyyy, day_offset=0, league_id="00").get_data_frames()
+    except Exception:
+        return pd.DataFrame(columns=["GAME_ID", "HOME_TEAM_ID", "VISITOR_TEAM_ID"])
+
+    if not frames:
+        return pd.DataFrame(columns=["GAME_ID", "HOME_TEAM_ID", "VISITOR_TEAM_ID"])
+
+    game_header = frames[0].copy()
+    required = {"GAME_ID", "HOME_TEAM_ID", "VISITOR_TEAM_ID"}
+    if not required.issubset(game_header.columns):
+        return pd.DataFrame(columns=["GAME_ID", "HOME_TEAM_ID", "VISITOR_TEAM_ID"])
+
+    result = game_header[["GAME_ID", "HOME_TEAM_ID", "VISITOR_TEAM_ID"]].copy()
+    result["HOME_TEAM_ID"] = pd.to_numeric(result["HOME_TEAM_ID"], errors="coerce")
+    result["VISITOR_TEAM_ID"] = pd.to_numeric(result["VISITOR_TEAM_ID"], errors="coerce")
+    result = result.dropna(subset=["HOME_TEAM_ID", "VISITOR_TEAM_ID"]).copy()
+    if result.empty:
+        return pd.DataFrame(columns=["GAME_ID", "HOME_TEAM_ID", "VISITOR_TEAM_ID"])
+    result["HOME_TEAM_ID"] = result["HOME_TEAM_ID"].astype(int)
+    result["VISITOR_TEAM_ID"] = result["VISITOR_TEAM_ID"].astype(int)
+    return result.reset_index(drop=True)
+
+
+def _is_postseason_game_id(game_id: object) -> bool:
+    """Infer playoff/postseason game types from NBA game-id prefixes."""
+    value = str(game_id or "").strip()
+    if len(value) < 3:
+        return False
+    return value[:3] in {"004", "005"}
+
+
+def _resolve_live_is_playoff(home_team_id: int, away_team_id: int, game_date: object) -> bool:
+    """Resolve playoff flag for a live matchup; defaults to False if uncertain."""
+    try:
+        home_id = int(home_team_id)
+        away_id = int(away_team_id)
+    except (TypeError, ValueError):
+        return False
+
+    parsed_date = pd.to_datetime(game_date, errors="coerce")
+    if pd.isna(parsed_date):
+        return False
+
+    day = pd.Timestamp(parsed_date).normalize()
+    # Live event timestamps are UTC; checking adjacent days avoids EST/UTC rollover misses.
+    candidate_days = [day - pd.Timedelta(days=1), day, day + pd.Timedelta(days=1)]
+
+    for candidate_day in candidate_days:
+        date_arg = candidate_day.strftime("%m/%d/%Y")
+        games = _load_scoreboard_games_for_date(date_arg)
+        if games.empty:
+            continue
+
+        direct_match = games[
+            (games["HOME_TEAM_ID"] == home_id)
+            & (games["VISITOR_TEAM_ID"] == away_id)
+        ]
+        if not direct_match.empty:
+            return _is_postseason_game_id(direct_match.iloc[0].get("GAME_ID"))
+
+    return False
+
+
 def _build_team_abbreviation_map(teams_df: pd.DataFrame) -> dict[str, int]:
     """Build TEAM_ABBREVIATION -> TEAM_ID map."""
     if "TEAM_ABBREVIATION" not in teams_df.columns:
@@ -502,13 +569,26 @@ if page == "Betting Lines":
 
     pred_frames: list[pd.DataFrame] = []
     unique_matchups = (
-        live_df[["home_team_id", "away_team_id"]]
-        .dropna()
-        .drop_duplicates()
-        .astype(int)
-        .itertuples(index=False, name=None)
+        live_df[["home_team_id", "away_team_id", "game_date"]]
+        .dropna(subset=["home_team_id", "away_team_id"])
+        .copy()
     )
-    for home_team_id, away_team_id in unique_matchups:
+    unique_matchups["home_team_id"] = unique_matchups["home_team_id"].astype(int)
+    unique_matchups["away_team_id"] = unique_matchups["away_team_id"].astype(int)
+    unique_matchups = (
+        unique_matchups.sort_values("game_date")
+        .groupby(["home_team_id", "away_team_id"], as_index=False, observed=False)
+        .first()
+    )
+
+    for matchup in unique_matchups.itertuples(index=False):
+        home_team_id = int(matchup.home_team_id)
+        away_team_id = int(matchup.away_team_id)
+        is_playoff_matchup = _resolve_live_is_playoff(
+            home_team_id=home_team_id,
+            away_team_id=away_team_id,
+            game_date=matchup.game_date,
+        )
         try:
             matchup_pred = predict_matchup(
                 artifacts=artifacts,
@@ -517,7 +597,7 @@ if page == "Betting Lines":
                 history_df=train_df,
                 home_team_id=home_team_id,
                 away_team_id=away_team_id,
-                is_playoff=False,
+                is_playoff=is_playoff_matchup,
                 enforce_official_roster=True,
             )
         except Exception:
@@ -594,7 +674,7 @@ if page == "Betting Lines":
     )
 
     merged["q50"] = pd.to_numeric(merged["q50"], errors="coerce")
-    merged["edge"] = merged["line"] - merged["q50"]
+    merged["edge"] = merged["q50"] - merged["line"]
     merged["model_recommendation"] = "pending"
     over_mask = merged["q50"].notna() & merged["line"].notna() & (merged["q50"] > merged["line"])
     under_mask = merged["q50"].notna() & merged["line"].notna() & (merged["q50"] <= merged["line"])
@@ -753,7 +833,24 @@ if page == "Betting Lines":
                 st.info("Backtest CSV is empty.")
             else:
                 backtest_df["status"] = backtest_df.get("status", pd.Series(dtype="object")).astype(str).str.lower()
-                backtest_df["edge"] = pd.to_numeric(backtest_df.get("edge"), errors="coerce")
+                raw_hist_edge = pd.to_numeric(backtest_df.get("edge"), errors="coerce")
+                if "q50" in backtest_df.columns and "line" in backtest_df.columns:
+                    backtest_df["edge"] = (
+                        pd.to_numeric(backtest_df["q50"], errors="coerce")
+                        - pd.to_numeric(backtest_df["line"], errors="coerce")
+                    )
+                else:
+                    over_edge = raw_hist_edge[
+                        backtest_df.get("model_recommendation", pd.Series(dtype="object")).astype(str).str.lower().eq("over")
+                    ]
+                    under_edge = raw_hist_edge[
+                        backtest_df.get("model_recommendation", pd.Series(dtype="object")).astype(str).str.lower().eq("under")
+                    ]
+                    # Auto-detect legacy sign convention (line - model) and flip if detected.
+                    if not over_edge.empty and not under_edge.empty and over_edge.median() < 0 and under_edge.median() > 0:
+                        backtest_df["edge"] = -raw_hist_edge
+                    else:
+                        backtest_df["edge"] = raw_hist_edge
                 backtest_df["bookmaker"] = backtest_df.get("bookmaker", pd.Series(dtype="object")).astype(str)
                 backtest_df["model_recommendation"] = (
                     backtest_df.get("model_recommendation", pd.Series(dtype="object")).astype(str).str.lower()
