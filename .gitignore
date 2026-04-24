@@ -1,5 +1,6 @@
 nba_data.ipynb
 .DS_Store
+.env
 src/__pycache__/
 venv/
 models/player_prop_artifacts.pt

@@ -11,6 +11,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import pandas as pd
@@ -104,9 +105,31 @@ def _http_get_json(url: str, params: dict[str, Any], timeout: int = 30) -> tuple
     """Execute a small JSON GET request with standard-library networking only."""
     query = urlencode(params, doseq=True)
     full_url = f"{url}?{query}" if query else url
-    with urlopen(full_url, timeout=timeout) as response:
-        body = response.read().decode("utf-8")
-        headers = {str(k): str(v) for k, v in response.headers.items()}
+    try:
+        with urlopen(full_url, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+            headers = {str(k): str(v) for k, v in response.headers.items()}
+    except HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(error_body)
+        except json.JSONDecodeError:
+            payload = None
+
+        if isinstance(payload, dict):
+            error_code = str(payload.get("error_code", "")).strip()
+            message = str(payload.get("message", "")).strip()
+            details_url = str(payload.get("details_url", "")).strip()
+            parts = [f"The Odds API request failed ({exc.code})"]
+            if error_code:
+                parts.append(error_code)
+            if message:
+                parts.append(message)
+            if details_url:
+                parts.append(details_url)
+            raise ValueError(" | ".join(parts)) from exc
+
+        raise
     return json.loads(body), headers
 
 
@@ -122,16 +145,25 @@ def fetch_the_odds_api_player_points_lines(
     if not api_key:
         raise ValueError("Missing The Odds API key.")
 
+    # Player prop markets are primarily exposed via DFS sources in The Odds API.
+    # Default plain "us" requests can return 422 for prop markets, so steer those
+    # requests to the DFS region unless the caller explicitly chose another region.
+    request_regions = regions
+    if market.startswith("player_") and str(regions).strip().lower() == "us":
+        request_regions = "us_dfs"
+
     commence_from = datetime.now(UTC) - timedelta(hours=6)
     commence_to = commence_from + timedelta(days=max(commence_days, 1))
+    commence_from_str = commence_from.strftime("%Y-%m-%dT%H:%M:%SZ")
+    commence_to_str = commence_to.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     events, _ = _http_get_json(
         f"{ODDS_API_BASE_URL}/sports/{NBA_SPORT_KEY}/events",
         {
             "apiKey": api_key,
             "dateFormat": "iso",
-            "commenceTimeFrom": commence_from.isoformat().replace("+00:00", "Z"),
-            "commenceTimeTo": commence_to.isoformat().replace("+00:00", "Z"),
+            "commenceTimeFrom": commence_from_str,
+            "commenceTimeTo": commence_to_str,
         },
     )
     if not isinstance(events, list) or not events:
@@ -164,7 +196,7 @@ def fetch_the_odds_api_player_points_lines(
 
         event_params: dict[str, Any] = {
             "apiKey": api_key,
-            "regions": regions,
+            "regions": request_regions,
             "markets": market,
             "oddsFormat": "american",
             "dateFormat": "iso",

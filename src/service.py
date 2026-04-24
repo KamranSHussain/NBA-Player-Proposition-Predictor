@@ -690,7 +690,7 @@ def _predict_from_features(
 def _predict_test_set_with_transformer(
     df: pd.DataFrame,
     artifacts: ModelArtifacts,
-) -> tuple[pd.DataFrame, np.ndarray]:
+) -> tuple[pd.DataFrame, np.ndarray, list[int], list[int], list[float]]:
     """Generate test-split predictions for transformer artifacts."""
     feature_cols = artifacts.feature_columns
     sequence_length = int(getattr(artifacts, "sequence_length", DEFAULT_SEQUENCE_LENGTH))
@@ -706,6 +706,7 @@ def _predict_test_set_with_transformer(
         feature_cols=feature_cols,
         history_len=sequence_length,
     )
+    ordered_df["history_games_before_prediction"] = ordered_df.groupby("PLAYER_ID").cumcount().astype(int)
 
     test_idx = ordered_df[ordered_df["GAME_DATE"] > artifacts.train_end_date].index.to_numpy()
     if len(test_idx) == 0:
@@ -716,7 +717,27 @@ def _predict_test_set_with_transformer(
     with torch.no_grad():
         preds = artifacts.model(seq_tensor, padding_mask=mask_tensor).numpy()
 
-    return ordered_df.loc[test_idx].reset_index(drop=True), preds
+    test_df = ordered_df.loc[test_idx].copy().reset_index(drop=True)
+    reference_games = max(sequence_length - 1, 1)
+    total_history_games = test_df["history_games_before_prediction"].astype(int).tolist()
+    sequence_history_games = [min(total_games, reference_games) for total_games in total_history_games]
+    interval_scales = [
+        _history_interval_scale(
+            total_history_games=total_games,
+            sequence_history_games=seq_games,
+            reference_games=reference_games,
+        )
+        for total_games, seq_games in zip(total_history_games, sequence_history_games)
+    ]
+    preds = _apply_history_interval_calibration(
+        preds=preds,
+        quantiles=artifacts.quantiles,
+        total_history_games=total_history_games,
+        sequence_history_games=sequence_history_games,
+        reference_games=reference_games,
+    )
+
+    return test_df, preds, total_history_games, sequence_history_games, interval_scales
 
 
 def predict_matchup(
@@ -834,13 +855,10 @@ def _pinball_loss_numpy(y_true: np.ndarray, y_pred: np.ndarray, q: float) -> flo
 
 def evaluate_test_set(df: pd.DataFrame, artifacts: ModelArtifacts) -> TestSetEvaluation:
     """Evaluate trained artifacts on the date-split test set."""
-    full_df = df.copy()
-    full_df["GAME_DATE"] = pd.to_datetime(full_df["GAME_DATE"])
-    total_games_by_player = (
-        full_df.groupby("PLAYER_ID")["GAME_ID"].nunique().astype(float)
+    test_df, preds, total_history_games, sequence_history_games, interval_scales = _predict_test_set_with_transformer(
+        df=df,
+        artifacts=artifacts,
     )
-
-    test_df, preds = _predict_test_set_with_transformer(df=df, artifacts=artifacts)
     y_true = test_df[TARGET_COLUMN].to_numpy(dtype=float)
 
     quantile_rows: list[dict[str, float]] = []
@@ -911,9 +929,9 @@ def evaluate_test_set(df: pd.DataFrame, artifacts: ModelArtifacts) -> TestSetEva
     predictions["within_interval_q10_q90"] = (
         (predictions["actual"] >= q10) & (predictions["actual"] <= q90)
     )
-    predictions["total_games_in_dataset"] = (
-        predictions["PLAYER_ID"].map(total_games_by_player).fillna(0).astype(float)
-    )
+    predictions["history_games_before_prediction"] = np.asarray(total_history_games, dtype=float)
+    predictions["sequence_history_games"] = np.asarray(sequence_history_games, dtype=float)
+    predictions["interval_scale"] = np.asarray(interval_scales, dtype=float)
 
     # IQR-based residual outlier detection is robust to skewed error distributions.
     residual_q1 = float(predictions["residual_q50"].quantile(0.25))
@@ -952,20 +970,25 @@ def evaluate_test_set(df: pd.DataFrame, artifacts: ModelArtifacts) -> TestSetEva
     player_interval_profile = (
         predictions.groupby(["PLAYER_ID", "PLAYER_NAME"], as_index=False)
         .agg(
-            total_games_in_dataset=("total_games_in_dataset", "max"),
+            mean_history_games_before_prediction=("history_games_before_prediction", "mean"),
+            max_history_games_before_prediction=("history_games_before_prediction", "max"),
             test_rows=("PLAYER_ID", "size"),
             mean_interval_width_q10_q90=("interval_width_q10_q90", "mean"),
             mean_abs_error_q50=("abs_error_q50", "mean"),
+            mean_interval_scale=("interval_scale", "mean"),
             outlier_rate=("is_outlier", "mean"),
         )
-        .sort_values(by=["total_games_in_dataset", "mean_interval_width_q10_q90"], ascending=[False, False])
+        .sort_values(
+            by=["mean_history_games_before_prediction", "mean_interval_width_q10_q90"],
+            ascending=[False, False],
+        )
         .reset_index(drop=True)
     )
 
     bins = [-np.inf, 25, 100, np.inf]
     labels = ["few_games_1_25", "mid_games_26_100", "many_games_101_plus"]
     predictions["games_bucket"] = pd.cut(
-        predictions["total_games_in_dataset"], bins=bins, labels=labels
+        predictions["history_games_before_prediction"], bins=bins, labels=labels
     )
 
     bucket_rows: list[dict[str, float | str]] = []

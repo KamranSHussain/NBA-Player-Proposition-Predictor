@@ -177,12 +177,44 @@ DATA_START_YEAR = 2020
 TRAIN_TEST_SPLIT_DATE = pd.Timestamp("2024-06-18")
 MODEL_ARTIFACT_PATH = Path("models/player_prop_artifacts_opp28.pt")
 BETTING_LINES_PATH = Path("prize_picks_lines.csv")
+DOTENV_PATH = Path(".env")
 
 
 def _rolling_end_year_exclusive(today: date | None = None) -> int:
     """Return end_year (exclusive) so current season is included automatically."""
     today = today or date.today()
     return today.year + (1 if today.month >= 9 else 0)
+
+
+def _load_env_file(path: Path = DOTENV_PATH) -> dict[str, str]:
+    """Load simple KEY=VALUE pairs from a local .env file."""
+    if not path.exists():
+        return {}
+
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if value and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _mask_secret(value: str, keep: int = 4) -> str:
+    """Show only the tail of a secret for source/debug confirmation."""
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return "missing"
+    if len(cleaned) <= keep:
+        return "*" * len(cleaned)
+    return ("*" * max(len(cleaned) - keep, 0)) + cleaned[-keep:]
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
@@ -250,7 +282,7 @@ def load_betting_lines_csv(csv_path: str) -> pd.DataFrame:
 def load_live_betting_lines(
     api_key: str,
     player_team_map_items: tuple[tuple[str, str], ...],
-    regions: str = "us",
+    regions: str = "us_dfs",
     market: str = "player_points",
     commence_days: int = 3,
 ) -> pd.DataFrame:
@@ -326,6 +358,12 @@ def load_completed_player_stats_for_range(date_from_iso: str, date_to_iso: str) 
     return result
 
 
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def load_completed_player_stats_for_day(day_iso: str) -> pd.DataFrame:
+    """Fetch completed NBA player stats for one day via nba_api."""
+    return load_completed_player_stats_for_range(day_iso, day_iso)
+
+
 def _ensure_state_defaults() -> None:
     """Initialize required session state keys."""
     st.session_state.setdefault("data_loaded", False)
@@ -341,9 +379,11 @@ def _ensure_state_defaults() -> None:
     st.session_state.setdefault("last_matchup_key", None)
     st.session_state.setdefault("betting_preds_cache", {})
     st.session_state.setdefault("logged_live_line_snapshots", set())
+    st.session_state.setdefault("odds_api_key_input", "")
 
 
 _ensure_state_defaults()
+dotenv_values = _load_env_file()
 
 with st.sidebar:
     st.header("Setup")
@@ -392,7 +432,22 @@ artifacts = st.session_state.artifacts
 player_team_map_items = tuple(
     sorted(build_player_team_abbreviation_map(current_players, current_teams).items())
 )
-odds_api_key = os.getenv("ODDS_API_KEY", "").strip()
+odds_api_key = ""
+odds_api_key_source = "missing"
+env_odds_api_key = os.getenv("ODDS_API_KEY", "").strip()
+dotenv_odds_api_key = dotenv_values.get("ODDS_API_KEY", "").strip()
+sidebar_odds_api_key = st.session_state.odds_api_key_input.strip()
+
+if env_odds_api_key:
+    odds_api_key = env_odds_api_key
+    odds_api_key_source = "environment"
+elif dotenv_odds_api_key:
+    odds_api_key = dotenv_odds_api_key
+    odds_api_key_source = ".env"
+
+if sidebar_odds_api_key:
+    odds_api_key = sidebar_odds_api_key
+    odds_api_key_source = "sidebar"
 
 summary = model_summary(artifacts)
 
@@ -400,8 +455,21 @@ if page == "Betting Lines":
     st.divider()
     st.subheader("Betting Lines Command Center")
     st.caption(
-        "Use a CSV snapshot or a live Odds API feed for baseline lines. Completed-game actuals are fetched automatically from nba_api."
+        "Use a CSV snapshot or a live Odds API feed for baseline lines. Live player props are fetched from supported DFS-style books, and completed-game actuals are fetched automatically from nba_api."
     )
+    with st.expander("Live Odds Setup", expanded=False):
+        st.caption(
+            f"Odds API key source: {odds_api_key_source} | key: {_mask_secret(odds_api_key)}"
+        )
+        st.text_input(
+            "Odds API Key",
+            key="odds_api_key_input",
+            type="password",
+            help="Optional. Enter a The Odds API key here, set ODDS_API_KEY in your environment, or add it to a local .env file.",
+        )
+        if st.button("Clear Live Odds Key"):
+            st.session_state.odds_api_key_input = ""
+            st.rerun()
 
     source_options = ["CSV snapshot"]
     default_source_index = 0
@@ -578,21 +646,47 @@ if page == "Betting Lines":
     )
     scored["model_recommendation"] = scored["bet_side"]
 
-    # Pull official completed-game points from nba_api for each date represented in the lines file.
-    unique_days = sorted(scored["game_day"].dropna().dt.strftime("%Y-%m-%d").unique().tolist())
-    if unique_days:
-        min_day = unique_days[0]
-        max_day = unique_days[-1]
-        try:
-            with st.spinner("Fetching completed game stats from nba_api..."):
-                api_actuals = load_completed_player_stats_for_range(min_day, max_day)
-            api_actuals = api_actuals[api_actuals["game_day"].dt.strftime("%Y-%m-%d").isin(unique_days)].copy()
-            api_actuals = api_actuals.drop_duplicates(subset=["game_day", "team", "player_key"], keep="first")
-        except Exception as exc:
-            st.warning(f"nba_api fetch failed for range {min_day} to {max_day}: {exc}")
-            api_actuals = pd.DataFrame(columns=["game_day", "team", "player_key", "actual_value", "GAME_ID"])
+    # Pull official completed-game points from nba_api only for dates that should already be final.
+    today_day = pd.Timestamp(date.today()).normalize()
+    scored["game_day_local"] = pd.to_datetime(scored["game_day"], errors="coerce").dt.tz_localize(None)
+    completed_days = sorted(
+        scored.loc[scored["game_day_local"].notna() & (scored["game_day_local"] < today_day), "game_day_local"]
+        .dt.strftime("%Y-%m-%d")
+        .unique()
+        .tolist()
+    )
+    actual_frames: list[pd.DataFrame] = []
+    failed_actual_days: list[str] = []
+    if completed_days:
+        with st.spinner("Fetching completed game stats from nba_api..."):
+            for day_iso in completed_days:
+                try:
+                    day_actuals = load_completed_player_stats_for_day(day_iso)
+                except Exception:
+                    failed_actual_days.append(day_iso)
+                    continue
+                if not day_actuals.empty:
+                    actual_frames.append(day_actuals.copy())
+
+    if actual_frames:
+        api_actuals = pd.concat(actual_frames, ignore_index=True)
+        api_actuals = api_actuals.drop_duplicates(subset=["game_day", "team", "player_key"], keep="first")
     else:
         api_actuals = pd.DataFrame(columns=["game_day", "team", "player_key", "actual_value", "GAME_ID"])
+
+    if failed_actual_days:
+        if len(failed_actual_days) == 1:
+            st.warning(
+                f"nba_api grading fetch failed for {failed_actual_days[0]}. "
+                "Predictions are still available, but completed games from that day may remain ungraded."
+            )
+        else:
+            st.warning(
+                f"nba_api grading fetch failed for {len(failed_actual_days)} completed day(s): "
+                f"{', '.join(failed_actual_days[:3])}"
+                f"{'...' if len(failed_actual_days) > 3 else ''}. "
+                "Predictions are still available, but some completed games may remain ungraded."
+            )
 
     scored = scored.merge(
         api_actuals,
@@ -629,6 +723,11 @@ if page == "Betting Lines":
     )
 
     scored["status"] = "pending"
+    scored.loc[scored["game_day_local"].ge(today_day), "status"] = "scheduled"
+    scored.loc[
+        scored["game_day_local"].lt(today_day) & scored["actual_value"].isna(),
+        "status",
+    ] = "awaiting_results"
     scored.loc[scored["model_recommendation"] == "push", "status"] = "push"
     scored.loc[scored["actual_side"] == "push", "status"] = "push"
     scored.loc[graded_mask & (scored["correct"] == True), "status"] = "correct"
@@ -675,6 +774,12 @@ if page == "Betting Lines":
             elif row.get("bet_label") == "fair":
                 border = "#eab308"
                 badge_bg = "rgba(234, 179, 8, 0.18)"
+            elif row.get("status") == "scheduled":
+                border = "#0ea5e9"
+                badge_bg = "rgba(14, 165, 233, 0.18)"
+            elif row.get("status") == "awaiting_results":
+                border = "#8b5cf6"
+                badge_bg = "rgba(139, 92, 246, 0.18)"
             elif row.get("model_recommendation") in {"over", "under"}:
                 border = "#f97316"
                 badge_bg = "rgba(249, 115, 22, 0.2)"
@@ -760,6 +865,8 @@ if page == "Betting Lines":
                 color_discrete_map={
                     "correct": "#16a34a",
                     "incorrect": "#dc2626",
+                    "scheduled": "#0ea5e9",
+                    "awaiting_results": "#8b5cf6",
                     "pending": "#f97316",
                     "push": "#64748b",
                 },
@@ -782,6 +889,8 @@ if page == "Betting Lines":
                 color_discrete_map={
                     "correct": "#16a34a",
                     "incorrect": "#dc2626",
+                    "scheduled": "#0ea5e9",
+                    "awaiting_results": "#8b5cf6",
                     "pending": "#f97316",
                     "push": "#64748b",
                 },
@@ -924,16 +1033,22 @@ if page == "Test Stats":
         )
         st.plotly_chart(fig_calibration, use_container_width=True)
 
-        st.markdown("#### Interval Width vs Total Games In Dataset")
+        st.markdown("#### Interval Width vs History Games Before Prediction")
         player_profile = test_eval.player_interval_profile.copy()
         if not player_profile.empty:
             fig_profile = px.scatter(
                 player_profile,
-                x="total_games_in_dataset",
+                x="mean_history_games_before_prediction",
                 y="mean_interval_width_q10_q90",
-                hover_data=["PLAYER_NAME", "outlier_rate", "test_rows"],
+                hover_data=[
+                    "PLAYER_NAME",
+                    "max_history_games_before_prediction",
+                    "mean_interval_scale",
+                    "outlier_rate",
+                    "test_rows",
+                ],
                 labels={
-                    "total_games_in_dataset": "Total games in dataset",
+                    "mean_history_games_before_prediction": "Mean history games before prediction",
                     "mean_interval_width_q10_q90": "Mean interval width (q10-q90)",
                 },
             )
