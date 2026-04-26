@@ -25,7 +25,7 @@ from src.service import (
     team_lookup,
 )
 
-st.set_page_config(page_title="NBA Player Prop Predictor", layout="wide")
+st.set_page_config(page_title="NBA Player Points Forecaster", layout="wide")
 
 st.markdown(
     """
@@ -125,6 +125,27 @@ p, label, div, span {
     box-shadow: 0 0 0 0.2rem rgba(249, 115, 22, 0.35);
 }
 
+[data-testid="stPopover"] button {
+    min-height: 0 !important;
+    padding: 0.2rem 0.5rem !important;
+    font-size: 0.72rem !important;
+    border-radius: 999px !important;
+    white-space: nowrap !important;
+    width: auto !important;
+}
+
+div[data-testid="stVerticalBlockBorderWrapper"]:has(span[data-card-tone="recommended"]) {
+    border-color: #16a34a !important;
+    box-shadow: inset 0 0 0 1px rgba(22, 163, 74, 0.5), 0 0 0 1px rgba(22, 163, 74, 0.18);
+    background: linear-gradient(180deg, rgba(22, 163, 74, 0.08), rgba(15, 23, 42, 0.06));
+}
+
+div[data-testid="stVerticalBlockBorderWrapper"]:has(span[data-card-tone="live"]) {
+    border-color: #ef4444 !important;
+    box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.42);
+    background: linear-gradient(180deg, rgba(239, 68, 68, 0.06), rgba(15, 23, 42, 0.04));
+}
+
 [data-baseweb="select"] > div,
 .stDateInput > div,
 .stNumberInput > div,
@@ -158,13 +179,10 @@ st.markdown(
     """
 <div class="sport-hero">
   <h2>NBA Player Prop Predictor</h2>
-  <p>Quantile-driven projections for matchup-focused prop research.</p>
 </div>
 """,
     unsafe_allow_html=True,
 )
-
-st.caption("Data and model load automatically, so you can jump straight to matchup quantile predictions.")
 
 DATA_START_YEAR = 2020
 TRAIN_TEST_SPLIT_DATE = pd.Timestamp("2024-06-18")
@@ -172,6 +190,7 @@ MODEL_ARTIFACT_PATH = Path("models/player_prop_artifacts_opp28.pt")
 BACKTEST_EVAL_PATH = Path("betting data/backtests/partner_odds_backtest.csv")
 RECOMMENDER_EDGE_MAX = -4.0
 RECOMMENDER_MIN_DECIMAL_ODDS = 1.81
+RECOMMENDER_Q90_LINE_RATIO = 1.0
 LIVE_REGION = "NY"
 LIVE_MAX_EVENTS = 8
 
@@ -423,6 +442,278 @@ def _format_american_odds(value: object) -> str:
     return f"+{rounded}" if rounded > 0 else str(rounded)
 
 
+def _apply_recommendation_rule(
+    df: pd.DataFrame,
+    *,
+    q50_col: str = "q50",
+    q90_col: str = "q90",
+    line_col: str = "line",
+    under_odds_col: str = "under_odds",
+) -> pd.DataFrame:
+    """Apply the under-only q90-distance recommendation rule."""
+    out = df.copy()
+    out[q50_col] = pd.to_numeric(out.get(q50_col), errors="coerce")
+    out[q90_col] = pd.to_numeric(out.get(q90_col), errors="coerce")
+    out[line_col] = pd.to_numeric(out.get(line_col), errors="coerce")
+    out[under_odds_col] = pd.to_numeric(out.get(under_odds_col), errors="coerce")
+
+    out["selection_side"] = pd.NA
+    out["selection_distance"] = (out[line_col] - out[q50_col]).abs()
+    out["tail_distance"] = (out[q90_col] - out[line_col]).abs()
+    out["selection_ratio"] = pd.NA
+
+    valid_ratio = out["tail_distance"].gt(0)
+    out.loc[valid_ratio, "selection_ratio"] = (
+        out.loc[valid_ratio, "selection_distance"] / out.loc[valid_ratio, "tail_distance"]
+    )
+    out.loc[
+        out["tail_distance"].eq(0) & out["selection_distance"].notna(),
+        "selection_ratio",
+    ] = float("inf")
+
+    under_candidate = (
+        out[line_col].gt(out[q50_col])
+        & out["selection_distance"].ge(RECOMMENDER_Q90_LINE_RATIO * out["tail_distance"])
+    )
+    out.loc[under_candidate, "selection_side"] = "under"
+
+    out["pick_odds"] = pd.NA
+    out.loc[out["selection_side"].eq("under"), "pick_odds"] = out.loc[
+        out["selection_side"].eq("under"),
+        under_odds_col,
+    ]
+    out["pick_odds_american"] = _decimal_series_to_american(pd.to_numeric(out["pick_odds"], errors="coerce"))
+    out["recommender_pick"] = out["selection_side"].eq("under") & out["pick_odds"].ge(RECOMMENDER_MIN_DECIMAL_ODDS)
+    out["is_recommended"] = out["recommender_pick"]
+    return out
+
+
+def _player_recent_games(
+    history_df: pd.DataFrame,
+    player_id: object,
+    team_id: object,
+    player_name: object,
+    max_games: int = 5,
+) -> pd.DataFrame:
+    """Return a player's most recent completed games from historical data."""
+    recent = pd.DataFrame()
+    if pd.notna(player_id) and "PLAYER_ID" in history_df.columns:
+        recent = history_df[history_df["PLAYER_ID"] == player_id].copy()
+
+    if recent.empty:
+        normalized_name = _normalize_player_name(player_name)
+        recent = history_df.copy()
+        recent["player_key"] = recent["PLAYER_NAME"].map(_normalize_player_name)
+        recent = recent[
+            recent["player_key"].eq(normalized_name)
+            & recent["TEAM_ID"].eq(team_id)
+        ].copy()
+
+    if recent.empty:
+        return pd.DataFrame(columns=["GAME_DATE", "PTS"])
+
+    recent["GAME_DATE"] = pd.to_datetime(recent["GAME_DATE"], errors="coerce")
+    recent["PTS"] = pd.to_numeric(recent["PTS"], errors="coerce")
+    recent = recent.dropna(subset=["GAME_DATE", "PTS"])
+    if recent.empty:
+        return pd.DataFrame(columns=["GAME_DATE", "PTS"])
+
+    recent = recent.sort_values(["GAME_DATE", "GAME_ID"]).tail(max_games).copy()
+    return recent[["GAME_DATE", "PTS"]].reset_index(drop=True)
+
+
+def _build_pick_detail_figure(
+    history_df: pd.DataFrame,
+    player_id: object,
+    team_id: object,
+    player_name: object,
+    prediction_value: object,
+    betting_line: object,
+) -> go.Figure:
+    """Create a compact bar chart for recent games vs model prediction and line."""
+    recent_games = _player_recent_games(
+        history_df=history_df,
+        player_id=player_id,
+        team_id=team_id,
+        player_name=player_name,
+    )
+
+    plot_rows: list[dict[str, object]] = []
+    for _, game in recent_games.iterrows():
+        plot_rows.append(
+            {
+                "label": pd.to_datetime(game["GAME_DATE"]).strftime("%b %d"),
+                "value": float(game["PTS"]),
+                "series": "Last 5 Games",
+            }
+        )
+
+    if pd.notna(prediction_value):
+        plot_rows.append(
+            {
+                "label": "Model q50",
+                "value": float(prediction_value),
+                "series": "Projection",
+            }
+        )
+
+    fig = go.Figure()
+    if not plot_rows:
+        fig.update_layout(
+            margin={"l": 10, "r": 10, "t": 30, "b": 10},
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis={"visible": False},
+            yaxis={"visible": False},
+            annotations=[
+                {
+                    "text": "No recent game data available.",
+                    "xref": "paper",
+                    "yref": "paper",
+                    "x": 0.5,
+                    "y": 0.5,
+                    "showarrow": False,
+                    "font": {"color": "#cbd5e1"},
+                }
+            ],
+        )
+        return fig
+
+    plot_df = pd.DataFrame(plot_rows)
+    color_map = {
+        "Last 5 Games": "#38bdf8",
+        "Projection": "#22c55e",
+    }
+    for series_name in ["Last 5 Games", "Projection"]:
+        series_df = plot_df[plot_df["series"] == series_name]
+        if series_df.empty:
+            continue
+        fig.add_trace(
+            go.Bar(
+                x=series_df["label"],
+                y=series_df["value"],
+                name=series_name,
+                marker_color=color_map[series_name],
+                hovertemplate="%{x}: %{y:.1f}<extra></extra>",
+            )
+        )
+
+    if pd.notna(betting_line):
+        line_value = float(betting_line)
+        fig.add_hline(
+            y=line_value,
+            line={"color": "#f97316", "width": 2, "dash": "dot"},
+            annotation_text=f"Bet line {line_value:.1f}",
+            annotation_position="top right",
+            annotation_font={"color": "#f97316"},
+        )
+
+    fig.update_layout(
+        barmode="group",
+        height=280,
+        margin={"l": 10, "r": 10, "t": 30, "b": 10},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis_title="",
+        yaxis_title="Points",
+        legend_title_text="",
+    )
+    return fig
+
+
+def _render_live_pick_card(row: pd.Series, train_df: pd.DataFrame, low_col: str | None, high_col: str | None) -> None:
+    """Render one live pick card with an inline recent-form popover."""
+    is_recommended = bool(row.get("is_recommended"))
+    badge_bg = "rgba(22, 163, 74, 0.2)" if is_recommended else "rgba(239, 68, 68, 0.2)"
+    badge_txt = "RECOMMENDED" if is_recommended else "LIVE"
+    pick = str(row.get("model_recommendation", "pending")).upper()
+    game_label = (
+        f"{pd.to_datetime(row.get('game_date')).strftime('%b %d %I:%M %p')} UTC"
+        if pd.notna(row.get("game_date"))
+        else "TBD"
+    )
+    interval_txt = "N/A"
+    if low_col and high_col and pd.notna(row.get(low_col)) and pd.notna(row.get(high_col)):
+        interval_txt = f"{float(row.get(low_col)):.1f} - {float(row.get(high_col)):.1f}"
+    with st.container(border=True):
+        st.markdown(
+            f"<span data-card-tone=\"{'recommended' if bool(row.get('is_recommended')) else 'live'}\" style='display:none;'></span>",
+            unsafe_allow_html=True,
+        )
+        if is_recommended:
+            st.markdown(
+                """
+<div style="height:4px;border-radius:999px;background:linear-gradient(90deg, rgba(34,197,94,0.95), rgba(134,239,172,0.45));margin:-0.2rem 0 0.55rem;"></div>
+""",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                """
+<div style="height:4px;border-radius:999px;background:linear-gradient(90deg, rgba(239,68,68,0.92), rgba(248,113,113,0.38));margin:-0.2rem 0 0.55rem;"></div>
+""",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown(
+            f"""
+<div style="min-height: 102px; display:flex; flex-direction:column; justify-content:flex-start;">
+  <div>
+    <div style='font-weight:700;font-size:1rem;color:#f8fafc;'>{row.get('player_name', 'Unknown Player')}</div>
+    <div style="margin:0.18rem 0 0.22rem;">
+      <span style="font-size:0.68rem;padding:0.12rem 0.45rem;border-radius:999px;background:{badge_bg};color:#e2e8f0;font-weight:700;white-space:nowrap;letter-spacing:0.03em;">
+        {badge_txt}
+      </span>
+    </div>
+    <div style='color:#94a3b8;font-size:0.82rem;'>{game_label} | {row.get('team', '?')} vs {row.get('opponent', '?')}</div>
+  </div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"""
+<div style="margin:0.12rem 0 0.22rem;">
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0.35rem;font-size:0.82rem;margin-top:0.15rem;">
+    <div><span style="color:#94a3b8;">Line</span><br><b style="color:#f1f5f9;">{float(row.get('line')):.1f}</b></div>
+    <div><span style="color:#94a3b8;">Model q50</span><br><b style="color:#f1f5f9;">{float(row.get('q50')):.1f}</b></div>
+    <div><span style="color:#94a3b8;">Edge</span><br><b style="color:#f1f5f9;">{float(row.get('edge')):+.1f}</b></div>
+  </div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"""
+<div style="min-height: 58px;">
+  <div style='font-size:0.78rem;color:#cbd5e1;'>Interval: <b>{interval_txt}</b></div>
+  <div style="font-size:0.76rem;color:#cbd5e1;line-height:1.55;margin-top:0.08rem;">
+    Pick: <b>{pick}</b><br>
+    Odds: <b>{_format_american_odds(row.get("pick_odds_american"))}</b>
+  </div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+        spacer_col, button_col = st.columns([3.2, 1.0])
+        with spacer_col:
+            st.markdown("")
+        with button_col:
+            with st.popover("Details"):
+                st.plotly_chart(
+                    _build_pick_detail_figure(
+                        history_df=train_df,
+                        player_id=row.get("PLAYER_ID"),
+                        team_id=row.get("team_id"),
+                        player_name=row.get("player_name"),
+                        prediction_value=row.get("q50"),
+                        betting_line=row.get("line"),
+                    ),
+                    use_container_width=True,
+                )
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def load_completed_player_stats_for_range(date_from_iso: str, date_to_iso: str) -> pd.DataFrame:
     """Fetch completed NBA player stats for a date range via nba_api."""
@@ -477,9 +768,6 @@ _ensure_state_defaults()
 
 with st.sidebar:
     st.header("Setup")
-    st.caption("Data and model are prepared automatically.")
-    st.caption(f"Data window: {DATA_START_YEAR} to present")
-    st.caption(f"Fixed split date: {TRAIN_TEST_SPLIT_DATE.date()}")
     page = st.radio("Page", options=["Predict Matchup", "Betting Lines", "Test Stats"], index=0)
 
 if not st.session_state.data_loaded or st.session_state.artifacts is None:
@@ -536,6 +824,27 @@ summary = model_summary(artifacts)
 if page == "Betting Lines":
     st.divider()
     st.subheader("Betting Lines Command Center")
+    min_american_odds = _format_american_odds(
+        _decimal_series_to_american(pd.Series([RECOMMENDER_MIN_DECIMAL_ODDS])).iloc[0]
+    )
+    st.markdown(
+        f"""
+<div style="
+    display:inline-block;
+    margin:0.2rem 0 0.9rem;
+    padding:0.45rem 0.75rem;
+    border-radius:999px;
+    border:1px solid #3b82f6;
+    background:rgba(59,130,246,0.14);
+    color:#dbeafe;
+    font-size:0.84rem;
+    font-weight:600;
+">
+  Recommendation rule: UNDER only when line &gt; q50, |line - q50| &ge; |q90 - line|, and under odds &ge; {min_american_odds} American
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
     if st.session_state.startup_live_lines_error:
         st.error(f"Could not load startup FanDuel lines: {st.session_state.startup_live_lines_error}")
@@ -569,16 +878,16 @@ if page == "Betting Lines":
 
     pred_frames: list[pd.DataFrame] = []
     unique_matchups = (
-        live_df[["home_team_id", "away_team_id", "game_date"]]
-        .dropna(subset=["home_team_id", "away_team_id"])
+        live_df[["event_id", "home_team_id", "away_team_id", "game_date"]]
+        .dropna(subset=["event_id", "home_team_id", "away_team_id"])
         .copy()
     )
+    unique_matchups["event_id"] = unique_matchups["event_id"].astype(str)
     unique_matchups["home_team_id"] = unique_matchups["home_team_id"].astype(int)
     unique_matchups["away_team_id"] = unique_matchups["away_team_id"].astype(int)
-    unique_matchups = (
-        unique_matchups.sort_values("game_date")
-        .groupby(["home_team_id", "away_team_id"], as_index=False, observed=False)
-        .first()
+    unique_matchups = unique_matchups.drop_duplicates(
+        subset=["event_id", "home_team_id", "away_team_id"],
+        keep="first",
     )
 
     for matchup in unique_matchups.itertuples(index=False):
@@ -605,6 +914,7 @@ if page == "Betting Lines":
         if matchup_pred is None or matchup_pred.empty:
             continue
         frame = matchup_pred.copy()
+        frame["event_id"] = str(matchup.event_id)
         frame["player_key"] = frame["PLAYER_NAME"].map(_normalize_player_name)
         pred_frames.append(frame)
 
@@ -613,7 +923,7 @@ if page == "Betting Lines":
         st.stop()
 
     preds = pd.concat(pred_frames, ignore_index=True)
-    preds = preds.drop_duplicates(subset=["TEAM_ID", "player_key"], keep="first")
+    preds = preds.drop_duplicates(subset=["event_id", "TEAM_ID", "player_key"], keep="first")
     quantile_cols = _sorted_quantile_columns(preds)
     if "q50" not in preds.columns:
         st.error("Model output is missing q50 predictions.")
@@ -665,40 +975,40 @@ if page == "Betting Lines":
     enriched["opponent"] = display_opp
     enriched["team_side"] = team_side
 
-    pred_cols = ["TEAM_ID", "player_key", *[col for col in quantile_cols if col in preds.columns]]
+    pred_cols = [
+        "event_id",
+        "PLAYER_ID",
+        "TEAM_ID",
+        "player_key",
+        *[col for col in quantile_cols if col in preds.columns],
+    ]
     merged = enriched.merge(
         preds[pred_cols],
-        left_on=["team_id", "player_key"],
-        right_on=["TEAM_ID", "player_key"],
+        left_on=["event_id", "team_id", "player_key"],
+        right_on=["event_id", "TEAM_ID", "player_key"],
         how="left",
     )
 
     merged["q50"] = pd.to_numeric(merged["q50"], errors="coerce")
+    merged["q90"] = pd.to_numeric(merged.get("q90"), errors="coerce")
     merged["edge"] = merged["q50"] - merged["line"]
     merged["model_recommendation"] = "pending"
     over_mask = merged["q50"].notna() & merged["line"].notna() & (merged["q50"] > merged["line"])
     under_mask = merged["q50"].notna() & merged["line"].notna() & (merged["q50"] <= merged["line"])
     merged.loc[over_mask, "model_recommendation"] = "over"
     merged.loc[under_mask, "model_recommendation"] = "under"
-
+    merged = _apply_recommendation_rule(merged)
     merged["pick_odds"] = merged["over_odds"].where(merged["model_recommendation"] == "over", merged["under_odds"])
     merged.loc[merged["model_recommendation"] == "pending", "pick_odds"] = pd.NA
-    merged["pick_odds_american"] = _decimal_series_to_american(merged["pick_odds"])
-    merged["recommender_pick"] = (
-        merged["edge"].le(RECOMMENDER_EDGE_MAX)
-        & merged["model_recommendation"].isin(["over", "under"])
-        & merged["pick_odds"].ge(RECOMMENDER_MIN_DECIMAL_ODDS)
-    )
+    merged["pick_odds_american"] = _decimal_series_to_american(pd.to_numeric(merged["pick_odds"], errors="coerce"))
     merged["recommendation_tier"] = 0
     merged.loc[
         merged["model_recommendation"].isin(["over", "under"]) & merged["pick_odds"].notna(),
         "recommendation_tier",
     ] = 1
     merged.loc[merged["recommender_pick"], "recommendation_tier"] = 2
-    # Only strict recommender-qualified bets are considered recommendations.
-    merged["is_recommended"] = merged["recommender_pick"]
     merged["status"] = "live"
-    merged["confidence"] = merged["edge"].abs()
+    merged["confidence"] = pd.to_numeric(merged["selection_ratio"], errors="coerce").fillna(0.0)
 
     valid_rows = merged[
         merged["line"].notna() & merged["over_odds"].notna() & merged["under_odds"].notna() & merged["player_name"].ne("")
@@ -723,8 +1033,24 @@ if page == "Betting Lines":
     sort_cols = [col for col, _ in sort_spec if col in projected.columns]
     sort_asc = [asc for col, asc in sort_spec if col in projected.columns]
 
-    card_source = recommended if not recommended.empty else projected
-    card_df = card_source.sort_values(sort_cols, ascending=sort_asc).head(12) if sort_cols else card_source.head(12)
+    card_limit = 12
+    if sort_cols:
+        recommended_cards = recommended.sort_values(sort_cols, ascending=sort_asc)
+        non_recommended_cards = projected[~projected["is_recommended"]].sort_values(
+            sort_cols,
+            ascending=sort_asc,
+        )
+    else:
+        recommended_cards = recommended
+        non_recommended_cards = projected[~projected["is_recommended"]]
+
+    card_df = pd.concat(
+        [
+            recommended_cards,
+            non_recommended_cards.head(max(card_limit - len(recommended_cards), 0)),
+        ],
+        ignore_index=True,
+    ).head(card_limit)
     st.markdown("#### Live FanDuel Pick Board")
     if card_df.empty:
         st.info("No live rows could be matched to model projections yet.")
@@ -732,61 +1058,17 @@ if page == "Betting Lines":
         quant_cols = _sorted_quantile_columns(projected)
         low_col = quant_cols[0] if len(quant_cols) >= 2 else None
         high_col = quant_cols[-1] if len(quant_cols) >= 2 else None
-        cards_html: list[str] = []
-        for _, row in card_df.iterrows():
-            border = "#16a34a" if bool(row.get("is_recommended")) else "#f97316"
-            badge_bg = "rgba(22, 163, 74, 0.2)" if bool(row.get("is_recommended")) else "rgba(249, 115, 22, 0.2)"
-            badge_txt = "RECOMMENDED" if bool(row.get("is_recommended")) else "LIVE"
-            pick = str(row.get("model_recommendation", "pending")).upper()
-            game_label = (
-                f"{pd.to_datetime(row.get('game_date')).strftime('%b %d %I:%M %p')} UTC"
-                if pd.notna(row.get("game_date"))
-                else "TBD"
-            )
-            interval_txt = "N/A"
-            if low_col and high_col and pd.notna(row.get(low_col)) and pd.notna(row.get(high_col)):
-                interval_txt = f"{float(row.get(low_col)):.1f} - {float(row.get(high_col)):.1f}"
-            cards_html.append(
-                f"""
-<div style="
-    border: 1px solid {border};
-    border-left: 5px solid {border};
-    border-radius: 12px;
-    padding: 0.75rem 0.85rem;
-    margin-bottom: 0.8rem;
-    background: linear-gradient(180deg, rgba(15,23,42,0.9), rgba(17,27,47,0.92));
-        min-height: 210px;
-        display: flex;
-        flex-direction: column;
-        justify-content: space-between;
-        box-sizing: border-box;
-">
-    <div>
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:0.6rem;">
-            <div style="font-weight:700;color:#f8fafc;">{row.get("player_name", "Unknown Player")}</div>
-        <div style="font-size:0.72rem;padding:0.12rem 0.4rem;border-radius:999px;background:{badge_bg};color:#e2e8f0;">{badge_txt}</div>
-        </div>
-        <div style="color:#94a3b8;font-size:0.82rem;">{game_label} | {row.get("team", "?")} vs {row.get("opponent", "?")}</div>
-        <div style="margin-top:0.4rem;display:grid;grid-template-columns:1fr 1fr 1fr;gap:0.35rem;font-size:0.82rem;">
-            <div><span style="color:#94a3b8;">Line</span><br><b style="color:#f1f5f9;">{float(row.get("line")):.1f}</b></div>
-            <div><span style="color:#94a3b8;">Model q50</span><br><b style="color:#f1f5f9;">{float(row.get("q50")):.1f}</b></div>
-            <div><span style="color:#94a3b8;">Edge</span><br><b style="color:#f1f5f9;">{float(row.get("edge")):+.1f}</b></div>
-        </div>
-        <div style="margin-top:0.35rem;font-size:0.78rem;color:#cbd5e1;">Interval: <b>{interval_txt}</b></div>
-  </div>
-  <div style="margin-top:0.45rem;display:flex;justify-content:space-between;align-items:center;">
-    <div style="font-size:0.76rem;color:#cbd5e1;">Pick: <b>{pick}</b></div>
-    <div style="font-size:0.76rem;color:#cbd5e1;">Odds: <b>{_format_american_odds(row.get("pick_odds_american"))}</b></div>
-  </div>
-</div>
-"""
-            )
-
-        for start in range(0, len(cards_html), 3):
+        for start in range(0, len(card_df), 3):
             row_cols = st.columns(3)
-            row_cards = cards_html[start : start + 3]
-            for col_idx, card_html in enumerate(row_cards):
-                row_cols[col_idx].markdown(card_html, unsafe_allow_html=True)
+            row_rows = card_df.iloc[start : start + 3].reset_index(drop=True)
+            for col_idx in range(len(row_rows)):
+                with row_cols[col_idx]:
+                    _render_live_pick_card(
+                        row=row_rows.iloc[col_idx],
+                        train_df=train_df,
+                        low_col=low_col,
+                        high_col=high_col,
+                    )
 
     display_cols = [
         "game_date",
@@ -855,25 +1137,22 @@ if page == "Betting Lines":
                 backtest_df["model_recommendation"] = (
                     backtest_df.get("model_recommendation", pd.Series(dtype="object")).astype(str).str.lower()
                 )
+                backtest_df["q50"] = pd.to_numeric(backtest_df.get("q50"), errors="coerce")
+                backtest_df["q90"] = pd.to_numeric(backtest_df.get("q90"), errors="coerce")
+                backtest_df["line"] = pd.to_numeric(backtest_df.get("line"), errors="coerce")
+                backtest_df["actual"] = pd.to_numeric(backtest_df.get("actual"), errors="coerce")
                 backtest_df["over_odds"] = pd.to_numeric(backtest_df.get("over_odds"), errors="coerce")
                 backtest_df["under_odds"] = pd.to_numeric(backtest_df.get("under_odds"), errors="coerce")
-                backtest_df["is_correct"] = backtest_df["status"].eq("correct")
                 backtest_df["game_date"] = pd.to_datetime(backtest_df.get("game_date"), errors="coerce")
-
-                backtest_df["pick_odds"] = backtest_df["over_odds"].where(
-                    backtest_df["model_recommendation"].eq("over"),
-                    backtest_df["under_odds"],
-                )
-                backtest_df.loc[
-                    ~backtest_df["model_recommendation"].isin(["over", "under"]),
-                    "pick_odds",
-                ] = pd.NA
+                backtest_df["actual_side_calc"] = pd.NA
+                backtest_df.loc[backtest_df["actual"].gt(backtest_df["line"]), "actual_side_calc"] = "over"
+                backtest_df.loc[backtest_df["actual"].lt(backtest_df["line"]), "actual_side_calc"] = "under"
+                backtest_df = _apply_recommendation_rule(backtest_df)
 
                 recommender_hist = backtest_df[
-                    backtest_df["edge"].le(RECOMMENDER_EDGE_MAX)
-                    & backtest_df["model_recommendation"].isin(["over", "under"])
-                    & backtest_df["pick_odds"].ge(RECOMMENDER_MIN_DECIMAL_ODDS)
+                    backtest_df["is_recommended"] & backtest_df["actual_side_calc"].isin(["under", "over"])
                 ].copy()
+                recommender_hist["is_correct"] = recommender_hist["selection_side"].eq(recommender_hist["actual_side_calc"])
 
                 if recommender_hist.empty:
                     st.info("No historical rows match the recommender rule yet.")
@@ -898,8 +1177,10 @@ if page == "Betting Lines":
                         pct_df,
                         values="count",
                         names="result",
-                        title="Percent of Recommendations Correct",
+                        title="Recommended Bets: Correct vs Incorrect",
                         hole=0.55,
+                        color="result",
+                        color_discrete_map={"Correct": "#22c55e", "Incorrect": "#ef4444"},
                     )
                     fig_pct.update_layout(margin={"l": 10, "r": 10, "t": 40, "b": 10})
                     st.plotly_chart(fig_pct, use_container_width=True)
@@ -930,7 +1211,7 @@ if page == "Betting Lines":
                             )
                         )
                         fig_time.update_layout(
-                            title="Cumulative Recommendation Accuracy Over Time",
+                            title="Cumulative Accuracy Over Time (q90 Distance Rule)",
                             margin={"l": 10, "r": 10, "t": 40, "b": 10},
                             yaxis_title="Accuracy",
                             xaxis_title="Week",
@@ -995,34 +1276,40 @@ if page == "Betting Lines":
                             )
                         )
                         fig_bankroll.update_layout(
-                            title="Cumulative Bankroll ($100 start, $1 per recommendation)",
+                            title="Cumulative Bankroll ($100 start, $1 per q90-distance recommendation)",
                             margin={"l": 10, "r": 10, "t": 40, "b": 10},
                             yaxis_title="Bankroll ($)",
                             xaxis_title="Date",
                         )
                         st.plotly_chart(fig_bankroll, use_container_width=True)
 
-                # Chart 4: Accuracy by edge bucket from <= -4 to >= 4.
-                edge_chart_df = backtest_df.dropna(subset=["edge"]).copy()
-                edge_bins = [-float("inf"), -4, -3, -2, -1, 0, 1, 2, 3, 4, float("inf")]
-                edge_labels = ["<= -4", "-4 to -3", "-3 to -2", "-2 to -1", "-1 to 0", "0 to 1", "1 to 2", "2 to 3", "3 to 4", ">= 4"]
-                edge_chart_df["edge_bucket"] = pd.cut(edge_chart_df["edge"], bins=edge_bins, labels=edge_labels)
-                edge_acc = (
-                    edge_chart_df.groupby("edge_bucket", observed=False)["is_correct"]
-                    .agg(accuracy="mean", picks="count")
-                    .reset_index()
+                side_rows = []
+                for side in ["under", "over"]:
+                    side_df = recommender_hist[recommender_hist["selection_side"] == side]
+                    side_rows.append(
+                        {
+                            "side": side.title(),
+                            "Correct": int(side_df["is_correct"].sum()),
+                            "Incorrect": int(len(side_df) - side_df["is_correct"].sum()),
+                        }
+                    )
+                side_chart_df = pd.DataFrame(side_rows).melt(
+                    id_vars="side",
+                    value_vars=["Correct", "Incorrect"],
+                    var_name="result",
+                    value_name="count",
                 )
-                fig_edge = px.bar(
-                    edge_acc,
-                    x="edge_bucket",
-                    y="accuracy",
-                    title="Accuracy by Edge (<= -4 to >= 4)",
-                    hover_data=["picks"],
-                    labels={"edge_bucket": "Edge Bucket", "accuracy": "Accuracy"},
+                fig_side = px.bar(
+                    side_chart_df,
+                    x="side",
+                    y="count",
+                    color="result",
+                    barmode="group",
+                    title="Recommended Bets by Side",
+                    color_discrete_map={"Correct": "#22c55e", "Incorrect": "#ef4444"},
                 )
-                fig_edge.update_yaxes(tickformat=".0%")
-                fig_edge.update_layout(margin={"l": 10, "r": 10, "t": 40, "b": 10}, showlegend=False)
-                st.plotly_chart(fig_edge, use_container_width=True)
+                fig_side.update_layout(margin={"l": 10, "r": 10, "t": 40, "b": 10}, xaxis_title="Side", yaxis_title="Bets")
+                st.plotly_chart(fig_side, use_container_width=True)
     st.stop()
 
 if page == "Test Stats":

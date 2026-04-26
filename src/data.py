@@ -127,6 +127,12 @@ def fetch_multiple_seasons(
             print(f"Failed to fetch data for {season}. Error: {exc}")
             time.sleep(5)
 
+    if not all_players_data or not all_teams_data:
+        raise RuntimeError(
+            "Unable to fetch NBA data for any season. "
+            "Check network/API availability and try again."
+        )
+
     players_raw = pd.concat(all_players_data, ignore_index=True)
     teams_raw = pd.concat(all_teams_data, ignore_index=True)
 
